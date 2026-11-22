@@ -2,6 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
+  "offline-bar", "offline-text", "refresh-cache",
   "toast", "toast-message", "toast-close", "new-event", "event-list", "welcome",
   "detail", "back-list", "compile-meta", "delete-event", "detail-loading",
   "composer", "material-text", "choose-images", "image-files", "image-queue",
@@ -14,6 +15,8 @@ const ui = Object.fromEntries([
 ].map((id) => [id, $(id)]));
 const narrow = window.matchMedia("(max-width: 768px)");
 const state = {
+  isOffline: false, cacheSupported: false, offlineEpoch: 0, offlineMeta: null,
+  offlineStatus: "unsupported", swRegistration: null, syncPromise: null, clearPromise: Promise.resolve(),
   events: [], selected: null, event: null, drafts: new Map(),
   authenticated: false, authConfigured: null, authBusy: false, authGeneration: 0,
   activeTab: "upcoming", archiveQuery: "",
@@ -29,6 +32,7 @@ const list = (value) => Array.isArray(value) ? value : [];
 const words = (value, fallback = "") => typeof value === "string" ? value : fallback;
 const object = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 const locked = () => !state.authenticated || state.busy || state.preparing > 0;
+const writeLocked = () => locked() || state.isOffline;
 function el(tag, className = "", content) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -57,6 +61,256 @@ function status(message = "", error = false) {
   ui["workflow-status"].textContent = message;
   ui["workflow-status"].classList.toggle("error", error);
 }
+const PRIVATE_CACHE = "eb-private-v1";
+const OFFLINE_META_KEY = "eb_offline_meta_v1";
+const LOCAL_CHECKS_KEY = "eb_local_checks_v1";
+const PENDING_LOGOUT_KEY = "eb_offline_logout_pending_v1";
+function readLocal(key, fallback = null) {
+  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
+}
+function writeLocal(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
+function privateReadPath(path) {
+  const url = new URL(path, location.origin);
+  return url.origin === location.origin && (url.pathname === "/api/events" ||
+    /^\/api\/events\/[^/]+$/.test(url.pathname) || url.pathname.startsWith("/api/images/"));
+}
+function offlineFailure() {
+  return Object.assign(new Error("当前离线且本机暂无该项缓存"), { offline: true, status: 503 });
+}
+async function timedFetch(path, options = {}, ms = 2500) {
+  const controller = new AbortController();
+  let timer;
+  try {
+    return await Promise.race([
+      fetch(path, { ...options, signal: controller.signal }),
+      new Promise((resolve, reject) => { timer = setTimeout(() => {
+        controller.abort(); reject(Object.assign(new Error("网络超时，已切换本地缓存"), { offline: true }));
+      }, ms); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+async function swMessage(type, wait = false) {
+  const worker = navigator.serviceWorker?.controller || state.swRegistration?.active;
+  if (!worker) return;
+  if (!wait || typeof MessageChannel === "undefined") { worker.postMessage({ type }); return; }
+  await new Promise(resolve => {
+    const channel = new MessageChannel(), timer = setTimeout(() => { channel.port1.close(); resolve(); }, 1200);
+    channel.port1.onmessage = () => { clearTimeout(timer); channel.port1.close(); resolve(); };
+    worker.postMessage({ type }, [channel.port2]);
+  });
+}
+function syncTime(meta = state.offlineMeta) {
+  const ms = timestamp(meta?.lastSyncAt);
+  return ms === null ? "尚未同步" : new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(ms);
+}
+function paintOfflineStatus(mode = state.offlineStatus, message = "") {
+  state.offlineStatus = mode;
+  ui["offline-bar"].dataset.state = mode;
+  const meta = state.offlineMeta;
+  ui["offline-text"].textContent = message || (mode === "ready"
+    ? "已离线就绪 · 同步于 " + syncTime() + " · 已缓存 " + meta.upcomingCount + " 场即将发生 / " + meta.imageCount + " 张关键图"
+    : mode === "syncing" ? "正在同步离线缓存..."
+    : mode === "offline" ? "当前离线模式 · 正在查看本地缓存副本（同步于 " + syncTime() + "）"
+    : mode === "unsupported" ? "当前环境不支持离线缓存，请使用 HTTPS 或本机 localhost / 127.0.0.1"
+    : "离线同步未完成，请联网后刷新缓存");
+  ui["refresh-cache"].disabled = !state.authenticated || state.isOffline || !state.cacheSupported || mode === "syncing";
+}
+function enterOfflineMode() {
+  if (!state.authenticated) return;
+  state.isOffline = true;
+  if (ui["field-editor"].open) ui["field-editor"].close();
+  closeCalendarDialog();
+  paintOfflineStatus("offline"); updateControls();
+}
+function clearAllOfflineData(notify = true) {
+  state.offlineEpoch++;
+  state.offlineMeta = null; state.syncPromise = null;
+  for (const key of [OFFLINE_META_KEY, LOCAL_CHECKS_KEY]) {
+    try { localStorage.removeItem(key); } catch { /* 浏览器存储不可用时不会允许离线启动。 */ }
+  }
+  const clear = async () => {
+    if ("caches" in window) await caches.delete(PRIVATE_CACHE);
+    if (notify) await swMessage("CLEAR_PRIVATE_CACHE", true);
+  };
+  state.clearPromise = clear().catch(() => {
+    ui["auth-message"].textContent = "本机私密缓存清理失败，请清除浏览器站点数据后再使用。";
+  });
+  return state.clearPromise;
+}
+async function cachedPrivateResponse(path) {
+  if (!state.authenticated || !state.cacheSupported) throw offlineFailure();
+  const epoch = state.offlineEpoch;
+  const response = await (await caches.open(PRIVATE_CACHE)).match(path);
+  if (!response || epoch !== state.offlineEpoch || !state.authenticated) throw offlineFailure();
+  const headers = new Headers(response.headers); headers.set("X-EB-Offline-Cache", "1");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+async function pwaRead(path, options) {
+  const generation = state.authGeneration, epoch = state.offlineEpoch;
+  if (state.isOffline) return cachedPrivateResponse(path);
+  try { return await timedFetch(path, { ...options, cache: "no-store" }); }
+  catch (error) {
+    if (generation !== state.authGeneration || epoch !== state.offlineEpoch) throw authInterrupted();
+    if (!state.authenticated) throw error;
+    enterOfflineMode();
+    return cachedPrivateResponse(path);
+  }
+}
+async function tryOfflineBoot() {
+  if (!state.cacheSupported || readLocal(PENDING_LOGOUT_KEY, false)) return false;
+  const meta = readLocal(OFFLINE_META_KEY);
+  if (!meta?.hasOfflineSnapshot) return false;
+  const epoch = state.offlineEpoch;
+  const cache = await caches.open(PRIVATE_CACHE), response = await cache.match("/api/events");
+  if (!response || epoch !== state.offlineEpoch) return false;
+  let data;
+  try { data = await response.json(); } catch { return false; }
+  if (!data.ok || !Array.isArray(data.events)) return false;
+  const available = [];
+  for (const event of data.events) {
+    if (event.timeline_bucket === "upcoming" && await cache.match(eventPath(event.id))) available.push(event);
+  }
+  if (epoch !== state.offlineEpoch) return false;
+  state.authenticated = true; state.authConfigured = true; state.authGeneration++;
+  state.offlineMeta = meta; state.isOffline = true; state.events = data.events;
+  ui["auth-gate"].hidden = true; ui.workspace.hidden = false;
+  ui["auth-token"].value = "";
+  await swMessage("ENABLE_PRIVATE_CACHE", true);
+  if (epoch !== state.offlineEpoch || !state.authenticated) return false;
+  renderList(); paintOfflineStatus("offline"); updateControls();
+  if (available.length) await selectEvent(available[0].id);
+  return true;
+}
+async function fetchForSync(path, epoch, generation) {
+  let response;
+  try { response = await timedFetch(path, { credentials: "same-origin", cache: "reload" }); }
+  catch { if (epoch === state.offlineEpoch && generation === state.authGeneration) enterOfflineMode(); throw offlineFailure(); }
+  if (epoch !== state.offlineEpoch || generation !== state.authGeneration || !state.authenticated) throw authInterrupted();
+  if (response.status === 401) { showGate(); await state.clearPromise; throw authInterrupted(); }
+  if (response.headers.get("X-EB-Offline-Cache") === "1") { enterOfflineMode(); throw offlineFailure(); }
+  if (!response.ok) throw new Error("离线同步失败（HTTP " + response.status + "）");
+  return response;
+}
+function syncUpcomingOfflineCache(upcomingEvents, force = false) {
+  if (!state.cacheSupported || !state.authenticated || state.isOffline) return Promise.resolve();
+  if (state.syncPromise) return state.syncPromise;
+  const epoch = state.offlineEpoch, generation = state.authGeneration;
+  const current = () => epoch === state.offlineEpoch && generation === state.authGeneration && state.authenticated && !state.isOffline;
+  const task = (async () => {
+    await state.clearPromise;
+    if (!current()) return;
+    await state.swReadyPromise;
+    if (!current() || !state.cacheSupported) return;
+    await swMessage("ENABLE_PRIVATE_CACHE", true);
+    if (!current()) return;
+    paintOfflineStatus("syncing");
+    const cache = await caches.open(PRIVATE_CACHE), old = readLocal(OFFLINE_META_KEY, {});
+    const versions = {}, images = new Set(), detailPaths = new Set();
+    const listResponse = await fetchForSync("/api/events", epoch, generation);
+    const data = await listResponse.clone().json();
+    if (!data.ok || !Array.isArray(data.events)) throw new Error("活动列表无法用于离线同步");
+    const upcoming = data.events.filter(event => event.timeline_bucket === "upcoming");
+    if (!current()) return;
+    for (const event of upcoming) {
+      const path = eventPath(event.id); detailPaths.add(path);
+      let response = await cache.match(path);
+      if (force || old.cachedEventVersions?.[event.id] !== event.version || !response) {
+        response = await fetchForSync(path, epoch, generation);
+        if (!current()) return;
+        await cache.put(path, response.clone());
+      }
+      const detail = (await response.json()).event;
+      if (!detail) throw new Error("活动详情无法用于离线同步");
+      versions[event.id] = detail.version;
+      const view = presentation(detail), ids = new Set(list(view?.l1_core?.credential_item_ids));
+      for (const zone of list(view?.l2_modules?.zones)) for (const id of list(zone?.map_item_ids)) ids.add(id);
+      for (const raw of list(detail.raw_items)) {
+        if (raw.type !== "image" || !ids.has(raw.id)) continue;
+        const full = imageUrl(raw);
+        if (!full) continue;
+        const url = new URL(full).pathname + new URL(full).search; images.add(url);
+        if (force || !await cache.match(url)) {
+          const image = await fetchForSync(url, epoch, generation);
+          if (!current()) return;
+          await cache.put(url, image.clone());
+        }
+      }
+      if (!current()) return;
+    }
+    if (!current()) return;
+    await cache.put("/api/events", listResponse);
+    for (const request of await cache.keys()) {
+      const url = new URL(request.url);
+      if (url.pathname === "/api/events" && !url.search) continue;
+      const path = url.pathname + url.search;
+      if (!detailPaths.has(path) && !images.has(path)) await cache.delete(request);
+    }
+    if (!current()) return;
+    const meta = { hasOfflineSnapshot: true, lastSyncAt: new Date().toISOString(),
+      upcomingCount: upcoming.length, imageCount: images.size, cachedEventVersions: versions, cachedImageUrls: [...images] };
+    writeLocal(OFFLINE_META_KEY, meta);
+    state.offlineMeta = meta; paintOfflineStatus("ready");
+  })().catch(error => {
+    if (current() && error.status !== 401) paintOfflineStatus("error", error.message || "离线同步未完成");
+  }).finally(() => { if (state.syncPromise === task) state.syncPromise = null; });
+  state.syncPromise = task;
+  return task;
+}
+function localCheck(eventId, fingerprint, text, className = "") {
+  const label = el("label", "local-check " + className), input = el("input"), caption = el("span", "", text);
+  input.type = "checkbox";
+  const checks = readLocal(LOCAL_CHECKS_KEY, {});
+  input.checked = checks[eventId]?.[fingerprint] === true;
+  caption.classList.toggle("completed", input.checked);
+  input.addEventListener("change", () => {
+    if (!state.authenticated) { input.checked = false; return; }
+    const data = readLocal(LOCAL_CHECKS_KEY, {});
+    // 使用 own-property 防止活动/条目文本影响对象原型。
+    const perEvent = Object.hasOwn(data, eventId) && data[eventId] && typeof data[eventId] === "object" ? data[eventId] : {};
+    const next = { ...data, [eventId]: { ...perEvent, [fingerprint]: input.checked } };
+    try { writeLocal(LOCAL_CHECKS_KEY, next); caption.classList.toggle("completed", input.checked); }
+    catch { input.checked = !input.checked; toast("浏览器未允许保存本机勾选状态", "warning"); }
+  });
+  label.append(input, caption);
+  return label;
+}
+async function flushPendingLogout() {
+  if (!readLocal(PENDING_LOGOUT_KEY, false)) return;
+  const response = await timedFetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+  if (!response.ok) throw new Error("上次本地退出尚未完成，请联网后重试");
+  localStorage.removeItem(PENDING_LOGOUT_KEY);
+}
+function setupPwa() {
+  state.cacheSupported = window.isSecureContext && "serviceWorker" in navigator && "caches" in window;
+  if (!state.cacheSupported) { paintOfflineStatus("unsupported"); return; }
+  try { localStorage.setItem("eb_storage_probe", "1"); localStorage.removeItem("eb_storage_probe"); }
+  catch { state.cacheSupported = false; paintOfflineStatus("unsupported"); return; }
+  navigator.serviceWorker.addEventListener("message", event => {
+    if (event.data?.type === "AUTHORIZE_PRIVATE_READ") {
+      event.ports?.[0]?.postMessage({ authorized: state.authenticated && !readLocal(PENDING_LOGOUT_KEY, false) });
+      return;
+    }
+    if (event.data?.type === "PRIVATE_CACHE_CLEARED") {
+      showGate("会话已锁定，请重新输入访问口令", false);
+      clearAllOfflineData(false);
+    }
+  });
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (state.authenticated) swMessage("ENABLE_PRIVATE_CACHE").catch(() => {});
+  });
+  state.swReadyPromise = navigator.serviceWorker.register("/sw.js", { scope: "/" }).then(async registration => {
+    await navigator.serviceWorker.ready;
+    ui["offline-bar"].dataset.worker = "active";
+    state.swRegistration = registration;
+    if (registration.waiting) registration.waiting.postMessage({ type: "SKIP_WAITING" });
+    if (state.authenticated) swMessage("ENABLE_PRIVATE_CACHE").catch(() => {});
+  }).catch(() => { state.cacheSupported = false; paintOfflineStatus("unsupported"); });
+}
+async function init() {
+  setupPwa();
+  await checkAuth();
+}
+
 function authInterrupted() {
   return Object.assign(new Error("请先输入访问口令"), { status: 401 });
 }
@@ -66,7 +320,9 @@ function updateAuthControls() {
   ui["login-submit"].textContent = state.authBusy ? "正在验证…" :
     state.authConfigured === null ? "重试连接" : "进入看板";
 }
-function showGate(message = "请先输入访问口令") {
+function showGate(message = "请先输入访问口令", clearOffline = true) {
+  if (clearOffline) clearAllOfflineData();
+  state.isOffline = false;
   closeCalendarDialog();
   state.busy = false; closeEditor();
   state.authGeneration++;
@@ -99,18 +355,24 @@ async function apiFetch(path, options = {}, responseType = "json") {
   const generation = state.authGeneration;
   let response;
   try {
-    response = await fetch(path, { ...options, credentials: "same-origin" });
+    const method = (options.method || "GET").toUpperCase();
+    if (state.isOffline && !(method === "GET" && (privateReadPath(path) || path === "/api/auth/status"))) throw offlineFailure();
+    const requestOptions = { ...options, credentials: "same-origin" };
+    response = method === "GET" && privateReadPath(path) ? await pwaRead(path, requestOptions)
+      : path === "/api/auth/status" ? await timedFetch(path, requestOptions) : await fetch(path, requestOptions);
   } catch {
     if (generation !== state.authGeneration) throw authInterrupted();
-    throw new Error("网络连接失败，请检查连接后重试");
+    throw Object.assign(new Error("网络连接失败，请检查连接后重试"), { offline: true });
   }
   if (generation !== state.authGeneration) throw authInterrupted();
   if (response.status === 401) {
     showGate();
+    await state.clearPromise;
     let data;
     try { data = await response.json(); } catch { /* 门禁已经即时关闭。 */ }
     throw Object.assign(new Error(words(data?.error) || "请先输入访问口令"), { status: 401 });
   }
+  if (response.headers.get("X-EB-Offline-Cache") === "1") enterOfflineMode();
   if (response.ok && responseType === "blob") {
     const blob = await response.blob();
     if (generation !== state.authGeneration) throw authInterrupted();
@@ -121,16 +383,22 @@ async function apiFetch(path, options = {}, responseType = "json") {
   catch { throw new Error("服务返回了无法读取的响应（HTTP " + response.status + "），请稍后重试"); }
   if (generation !== state.authGeneration) throw authInterrupted();
   if (!response.ok || !data?.ok) {
-    throw Object.assign(new Error(words(data?.error) || "请求失败（HTTP " + response.status + "）"), { status: response.status });
+    throw Object.assign(new Error(words(data?.error) || "请求失败（HTTP " + response.status + "）"), { status: response.status, offline: data?.offline === true });
   }
   return data;
 }
 async function enterWorkspace() {
   state.authenticated = true; state.authGeneration++;
+  const workspaceGeneration = state.authGeneration;
+  state.isOffline = false; state.offlineMeta = readLocal(OFFLINE_META_KEY);
+  await state.clearPromise;
+  if (!state.authenticated || workspaceGeneration !== state.authGeneration) return;
+  await swMessage("ENABLE_PRIVATE_CACHE", true);
+  if (!state.authenticated || workspaceGeneration !== state.authGeneration) return;
   ui["auth-token"].value = ""; ui["auth-message"].textContent = "";
   ui["auth-gate"].hidden = true; ui.workspace.hidden = false;
   renderList(); updateControls();
-  try { await loadList(); }
+  try { await loadList(); if (state.selected && state.event) await refreshCurrent(); }
   catch (error) {
     if (!state.authenticated || error.status === 401) return;
     ui["event-list"].replaceChildren(el("p", "empty-state", error.message),
@@ -142,6 +410,7 @@ async function checkAuth() {
   const generation = state.authGeneration;
   state.authBusy = true; updateAuthControls();
   try {
+    await flushPendingLogout();
     const data = await apiFetch("/api/auth/status");
     if (generation !== state.authGeneration) return;
     state.authConfigured = data.auth_configured === true;
@@ -149,7 +418,12 @@ async function checkAuth() {
     else if (data.authenticated) await enterWorkspace();
     else showGate("请输入访问口令");
   } catch (error) {
-    if (error.status !== 401) showGate(error.message);
+    if (error.status !== 401) {
+      if (error.offline && await tryOfflineBoot()) return;
+      showGate(error.offline
+        ? "当前处于离线状态且本机暂无缓存，请在联网状态下登录一次以启用断网秒开"
+        : error.message);
+    }
   } finally { state.authBusy = false; updateAuthControls(); }
 }
 async function login(event) {
@@ -159,6 +433,7 @@ async function login(event) {
   const generation = state.authGeneration;
   state.authBusy = true; ui["auth-message"].textContent = ""; updateAuthControls();
   try {
+    await flushPendingLogout();
     await apiFetch("/api/auth/login", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: ui["auth-token"].value }),
@@ -176,9 +451,17 @@ async function login(event) {
 async function logout() {
   if (state.authBusy) return;
   state.authBusy = true;
+  const wasOffline = state.isOffline || navigator.onLine === false;
+  try { writeLocal(PENDING_LOGOUT_KEY, true); } catch { /* 同步清缓存仍然执行。 */ }
   showGate("正在安全退出…");
   try {
+    await state.clearPromise;
+    if (wasOffline) {
+      ui["auth-message"].textContent = "已清除本机缓存并锁定，联网后会完成服务端退出。";
+      return;
+    }
     await apiFetch("/api/auth/logout", { method: "POST" });
+    localStorage.removeItem(PENDING_LOGOUT_KEY);
     ui["auth-message"].textContent = "已锁定，请输入访问口令";
   } catch {
     ui["auth-message"].textContent = "页面已锁定，但服务端退出请求失败；请检查网络后重新加载并再次退出。";
@@ -189,7 +472,7 @@ async function logout() {
 }
 
 async function checkImageAuth() {
-  if (!state.authenticated) return;
+  if (!state.authenticated || state.isOffline) return;
   const generation = state.authGeneration;
   try {
     const data = await apiFetch("/api/auth/status");
@@ -211,7 +494,7 @@ function closeCalendarDialog() {
   ui["calendar-message"].textContent = "";
 }
 async function openCalendarDialog() {
-  if (!state.authenticated || state.authBusy) return;
+  if (!state.authenticated || state.authBusy || state.isOffline) return;
   const request = ++calendarInfoRequest;
   const generation = state.authGeneration;
   ui["calendar-url"].value = ""; ui["calendar-content"].hidden = true;
@@ -234,7 +517,7 @@ async function openCalendarDialog() {
   }
 }
 async function exportCalendar() {
-  if (locked() || !state.event) return;
+  if (state.isOffline || locked() || !state.event) return;
   if (timestamp(presentation(state.event)?.l1_core?.start_time) === null) {
     toast("时间待定，完善明确时间后可导出日程", "warning"); return;
   }
@@ -309,6 +592,7 @@ function closeEditor() {
   editorState=null;ui["editor-fields"].replaceChildren();ui["editor-error"].textContent="";
 }
 function openEditor(group) {
+  if (state.isOffline) return;
   if (narrow.matches || locked() || !presentation(state.event)) return;
   closeEditor();
   const data=presentation(state.event);
@@ -350,6 +634,7 @@ function readEditorValue(entry) {
   return value || null;
 }
 async function saveEditor(event) {
+  if (state.isOffline) return;
   event.preventDefault();
   if(narrow.matches||locked()||!editorState)return;
   const current=editorState,set={};
@@ -367,6 +652,7 @@ async function saveEditor(event) {
   }
 }
 async function patchOverrides(payload, message, fromEditor=false) {
+  if (state.isOffline) return;
   if(narrow.matches||locked()||!state.event)return;
   const id=state.selected,generation=state.authGeneration;
   state.busy=true;updateControls();ui["editor-save"].disabled=true;
@@ -503,28 +789,33 @@ async function loadList() {
   if (token !== state.listSequence) return;
   state.events = list(data.events);
   renderList();
+  if (!state.isOffline) syncUpcomingOfflineCache(state.events.filter(event => event.timeline_bucket === "upcoming"));
 }
 function updateControls() {
   const hasEvent = !!state.event && !state.loading;
   const d = state.selected ? draft() : { text: "", images: [] };
   const hasInput = !!d.text.trim() || d.images.some((item) => !item.uploaded);
   ui["save-compile"].textContent = !hasInput && list(state.event?.raw_items).length ? "重新整理" : "保存并整理";
-  ui["save-compile"].disabled = locked() || !hasEvent || (!hasInput && !list(state.event?.raw_items).length);
-  ui["save-only"].disabled = locked() || !hasEvent || !hasInput;
-  ui["new-event"].disabled = locked();
-  ui["delete-event"].disabled = locked() || !hasEvent;
-  ui["choose-images"].disabled = locked() || !hasEvent;
-  ui["material-text"].disabled = state.busy || !hasEvent;
+  ui["save-compile"].disabled = writeLocked() || !hasEvent || (!hasInput && !list(state.event?.raw_items).length);
+  ui["save-only"].disabled = writeLocked() || !hasEvent || !hasInput;
+  ui["new-event"].disabled = writeLocked();
+  ui["delete-event"].disabled = writeLocked() || !hasEvent;
+  ui["choose-images"].disabled = writeLocked() || !hasEvent;
+  ui["material-text"].disabled = state.busy || state.isOffline || !hasEvent;
   ui["back-list"].disabled = locked();
   ui["upcoming-tab"].disabled = locked();
   ui["archived-tab"].disabled = locked();
   ui["archive-search"].disabled = locked();
-  document.querySelectorAll("[data-navigation], [data-mutating]").forEach((node) => {
+  document.querySelectorAll("[data-navigation]").forEach((node) => {
     node.disabled = locked();
   });
+  document.querySelectorAll("[data-mutating]").forEach(node => { node.disabled = writeLocked(); });
+  ui["editor-save"].disabled = writeLocked();
+  ui["calendar-subscribe"].disabled = state.isOffline || !state.authenticated;
   document.querySelectorAll("[data-calendar-export]").forEach(node => {
-    node.disabled = locked() || timestamp(presentation(state.event)?.l1_core?.start_time) === null;
+    node.disabled = writeLocked() || timestamp(presentation(state.event)?.l1_core?.start_time) === null;
   });
+  paintOfflineStatus();
   ui.composer.setAttribute("aria-busy", String(locked()));
 }
 function renderQueue() {
@@ -728,7 +1019,7 @@ function renderCards(event) {
     const section = card("展馆与区域");
     for (const entry of modules.zones) {
       const zone = object(entry), row = el("div", "zone-entry");
-      row.append(el("h3", "", words(zone.name) || "区域"));
+      row.append(localCheck(event.id, "zone:" + words(zone.name), words(zone.name) || "区域", "zone-check"));
       addTags(row, zone.highlights);
       imageReferences(row, zone.map_item_ids, event);
       section.append(row);
@@ -737,7 +1028,9 @@ function renderCards(event) {
   }
   if (list(modules.personal_focus).length) {
     const section = card("个人关注与目标"), items = el("ul", "focus-list");
-    for (const value of modules.personal_focus) if (typeof value === "string") items.append(el("li", "", value));
+    for (const value of modules.personal_focus) if (typeof value === "string") {
+      const row=el("li");row.append(localCheck(event.id,"focus:"+value,value));items.append(row);
+    }
     section.append(items);addEditTools(section,"focus",event); ui.cards.append(section);
   }
   if (list(modules.links_and_contacts).length) {
@@ -792,6 +1085,7 @@ async function refreshCurrent() {
   await loadList();
 }
 async function newEvent() {
+  if (state.isOffline) return;
   if(narrow.matches)return;
   if (locked()) return;
   state.busy = true; updateControls();
@@ -806,6 +1100,7 @@ async function newEvent() {
   await selectEvent(created.id, true);
 }
 async function deleteItem(eventId, itemId) {
+  if (state.isOffline) return;
   if(narrow.matches)return;
   if (locked() || !confirm("确定删除这条原始素材？此操作不可撤销。")) return;
   state.busy = true; updateControls();
@@ -816,6 +1111,7 @@ async function deleteItem(eventId, itemId) {
   } finally { state.busy = false; updateControls(); }
 }
 async function deleteEvent() {
+  if (state.isOffline) return;
   if(narrow.matches)return;
   if (locked() || !state.event || !confirm("确定删除整个活动及其所有原始素材和图片？此操作不可撤销。")) return;
   const id = state.selected;
@@ -835,6 +1131,7 @@ async function deleteEvent() {
   } finally { state.busy = false; updateControls(); }
 }
 async function persist(compile) {
+  if (state.isOffline) return;
   if(narrow.matches)return;
   if (locked() || !state.event) return;
   const id = state.selected, d = draft(id);
@@ -917,6 +1214,7 @@ async function prepareImage(file) {
   } finally { URL.revokeObjectURL(url); }
 }
 async function enqueueImages(files) {
+  if (state.isOffline) return;
   if(narrow.matches)return;
   if (locked() || !state.event) return;
   const d = draft(), errors = [], generation = state.authGeneration;
@@ -1015,10 +1313,10 @@ setInterval(() => {
       { time_state: node.dataset.timeState, timeline_bucket: node.dataset.bucket, effective_end_time: node.dataset.end });
     node.textContent = label; node.className = "badge " + kind;
   });
-  if (!locked()) loadList().catch(() => { /* 401 由 apiFetch 立即锁屏；短暂离线不反复弹窗。 */ });
+  if (!state.isOffline && !locked()) loadList().catch(() => { /* 401 由 apiFetch 立即锁屏；短暂离线不反复弹窗。 */ });
 }, 60000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && state.authenticated && !locked()) run(loadList);
+  if (!document.hidden && state.authenticated && !state.isOffline && !locked()) run(loadList);
 });
 ui["editor-form"].addEventListener("submit",event=>{event.preventDefault();run(()=>saveEditor(event))});
 ui["editor-cancel"].addEventListener("click",closeEditor);
@@ -1032,4 +1330,13 @@ ui["calendar-dialog"].addEventListener("close", () => {
 ui["calendar-copy"].addEventListener("click", () => {
   if (state.authenticated && ui["calendar-url"].value) run(() => copyText(ui["calendar-url"].value));
 });
-run(checkAuth);
+ui["refresh-cache"].addEventListener("click", () => {
+  if (!state.isOffline && state.authenticated) run(() => syncUpcomingOfflineCache([], true));
+});
+window.addEventListener("offline", () => enterOfflineMode());
+window.addEventListener("online", () => {
+  // 已展示的快照保留到认证结果返回；失败时仍可继续只读。
+  if (state.authBusy) return;
+  run(checkAuth);
+});
+run(init);

@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Event Board</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <meta name="theme-color" content="#2563eb">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Event Board">
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
 </head>
@@ -24,6 +30,7 @@
     </form>
   </section>
   <div id="workspace" class="app-shell" hidden>
+    <div id="offline-bar" class="offline-bar" data-state="unsupported" role="status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="offline-text">正在准备离线缓存…</span><button id="refresh-cache" class="button ghost" type="button">刷新缓存</button></div>
     <aside id="sidebar" class="sidebar" aria-label="活动列表">
       <header class="sidebar-header">
         <div class="sidebar-brand"><h1>Event Board</h1><div class="sidebar-actions"><button id="calendar-subscribe" class="button ghost" type="button">日历订阅</button><button id="lock-logout" class="button ghost" type="button">锁定退出</button></div></div>
