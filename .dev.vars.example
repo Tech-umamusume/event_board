@@ -1,0 +1,5 @@
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_API_KEY=sk-replace-with-your-bailian-key
+LLM_MODEL=qwen3.8-flash
+AUTH_TOKEN=replace-with-your-private-password
+CAL_TOKEN=replace-with-your-32-char-calendar-token

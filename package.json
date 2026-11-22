@@ -1,0 +1,13 @@
+{
+  "scripts": {
+    "db:init": "wrangler d1 execute event-board-db --local --file=./schema.sql",
+    "dev": "wrangler dev --port 8787"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "name": "event-board",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module"
+}

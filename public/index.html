@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Event Board</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden>
+    <span id="toast-message"></span>
+    <button id="toast-close" class="icon-button" aria-label="关闭提示">×</button>
+  </div>
+  <section id="auth-gate" class="auth-gate" aria-label="访问口令门禁">
+    <form id="auth-form" class="card auth-card">
+      <h1>Event Board</h1>
+      <p class="helper">输入访问口令，进入你的活动看板。</p>
+      <label for="auth-token">访问口令</label>
+      <input id="auth-token" name="token" type="password" autocomplete="current-password" required disabled aria-describedby="auth-message">
+      <button id="login-submit" class="button primary" type="submit" disabled>进入看板</button>
+      <p id="auth-message" class="auth-message" role="status" aria-live="polite">正在检查访问状态…</p>
+    </form>
+  </section>
+  <div id="workspace" class="app-shell" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="活动列表">
+      <header class="sidebar-header">
+        <div class="sidebar-brand"><h1>Event Board</h1><div class="sidebar-actions"><button id="calendar-subscribe" class="button ghost" type="button">日历订阅</button><button id="lock-logout" class="button ghost" type="button">锁定退出</button></div></div>
+        <button id="new-event" class="button primary">+ 新活动</button>
+      </header>
+      <div class="timeline-controls">
+        <div class="timeline-tabs" role="tablist" aria-label="活动时间轴">
+          <button id="upcoming-tab" type="button" role="tab" aria-selected="true" aria-controls="event-list">即将发生 (0)</button>
+          <button id="archived-tab" type="button" role="tab" aria-selected="false" aria-controls="event-list" tabindex="-1">历史归档 (0)</button>
+        </div>
+        <div id="archive-search-area" hidden>
+          <label for="archive-search" class="helper">搜索历史活动</label>
+          <input id="archive-search" type="search" placeholder="搜索标题、地点或时间" autocomplete="off">
+        </div>
+      </div>
+      <div id="event-list" class="event-list" role="tabpanel" aria-labelledby="upcoming-tab"></div>
+    </aside>
+    <main id="main" class="main">
+      <div id="welcome" class="welcome">
+        <h2>把散落的通知，整理成现场卡片。</h2>
+        <p>从左侧选择活动，或点击「+ 新活动」开始。</p>
+      </div>
+      <div id="detail" class="detail" hidden>
+        <header class="detail-header">
+          <button id="back-list" class="button ghost back-button">← 返回列表</button>
+          <span id="compile-meta" class="meta"></span>
+          <button id="delete-event" class="button ghost danger">删除活动</button>
+        </header>
+        <div id="detail-loading" class="empty-state" role="status" hidden>正在读取活动…</div>
+        <details id="composer" class="composer card" open>
+          <summary>展开追加素材</summary>
+          <div id="input-area" class="input-area">
+            <label for="material-text">追加素材</label>
+            <p class="helper">粘贴通知、聊天记录或链接，也可以直接粘贴、拖入图片。</p>
+            <textarea id="material-text" rows="5" placeholder="把活动通知粘贴在这里…" aria-describedby="input-help"></textarea>
+            <div class="input-tools">
+              <button id="choose-images" class="button ghost">选择图片</button>
+              <span id="input-help" class="helper">小截图保持清晰，大照片自动缩小</span>
+            </div>
+            <input id="image-files" type="file" accept="image/png,image/jpeg,image/jpg,image/webp,image/gif" multiple hidden>
+            <div id="image-queue" class="image-queue" aria-label="待上传图片"></div>
+            <div class="composer-actions">
+              <button id="save-compile" class="button primary">保存并整理</button>
+              <button id="save-only" class="button ghost">仅暂存素材</button>
+            </div>
+            <p id="workflow-status" class="workflow-status" role="status" aria-live="polite"></p>
+          </div>
+        </details>
+        <div id="cards" class="cards"></div>
+        <section id="archive" class="archive"></section>
+      </div>
+    </main>
+  </div>
+  <dialog id="calendar-dialog" class="calendar-dialog" aria-labelledby="calendar-title">
+    <div class="calendar-heading"><h2 id="calendar-title">日历订阅</h2><button id="calendar-close" class="icon-button" type="button" aria-label="关闭日历订阅">×</button></div>
+    <p id="calendar-message" class="auth-message" role="status" aria-live="polite"></p>
+    <div id="calendar-content" hidden>
+      <label for="calendar-url">订阅地址</label>
+      <input id="calendar-url" type="text" readonly autocomplete="off" spellcheck="false">
+      <button id="calendar-copy" class="button primary" type="button">一键复制订阅链接</button>
+      <ol class="calendar-help">
+        <li>可在飞书日历、滴答清单、Apple / Android 原生日历中添加 URL 订阅，具体入口以客户端支持为准。</li>
+        <li>本地 127.0.0.1 / localhost 或局域网地址无法供外部日历长期拉取；部署至云端公网域名后即可订阅。</li>
+        <li>妥善保管此链接，切勿公开分享。</li>
+      </ol>
+    </div>
+  </dialog>
+  <dialog id="field-editor" class="field-editor" aria-labelledby="editor-title">
+    <form id="editor-form">
+      <h2 id="editor-title">微调字段</h2>
+      <div id="editor-fields"></div>
+      <p id="editor-help" class="helper"></p>
+      <p id="editor-error" class="auth-message" role="alert"></p>
+      <div class="inline-actions">
+        <button id="editor-save" type="submit" class="button primary">保存并锁定</button>
+        <button id="editor-cancel" type="button" class="button ghost">取消</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="lightbox" class="lightbox" aria-label="全屏查看图片">
+    <button id="lightbox-close" class="icon-button lightbox-close" aria-label="关闭图片">×</button>
+    <div id="lightbox-space" class="lightbox-space">
+      <img id="lightbox-image" alt="放大的原始图片">
+    </div>
+    <p>强光下若扫码困难，请手动调高手机屏幕亮度</p>
+  </dialog>
+</body>
+</html>
