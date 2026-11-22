@@ -2,13 +2,14 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
   <title>Event Board</title>
   <link rel="manifest" href="/manifest.json">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="apple-touch-icon" href="/icon-192.png">
-  <meta name="theme-color" content="#2563eb">
+  <meta name="theme-color" content="#f3f6fb" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b0d12" media="(prefers-color-scheme: dark)">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Event Board">
   <link rel="stylesheet" href="/styles.css">
@@ -33,7 +34,7 @@
     <div id="offline-bar" class="offline-bar" data-state="unsupported" role="status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="offline-text">正在准备离线缓存…</span><button id="refresh-cache" class="button ghost" type="button">刷新缓存</button></div>
     <aside id="sidebar" class="sidebar" aria-label="活动列表">
       <header class="sidebar-header">
-        <div class="sidebar-brand"><h1>Event Board</h1><div class="sidebar-actions"><button id="calendar-subscribe" class="button ghost" type="button">日历订阅</button><button id="dida-settings" class="button ghost pc-only" type="button" aria-haspopup="dialog" aria-label="滴答同步：状态未知"><span id="dida-dot" class="dida-dot" aria-hidden="true"></span>滴答同步</button><button id="lock-logout" class="button ghost" type="button">锁定退出</button></div></div>
+        <div class="sidebar-brand"><h1>Event Board</h1><button id="mobile-sync-list" class="compact-sync mobile-only" type="button" aria-haspopup="dialog" aria-label="查看离线状态"></button><button id="mobile-more-list" class="icon-button mobile-only mobile-more" type="button" aria-label="更多操作" aria-haspopup="dialog"></button><div class="sidebar-actions"><button id="calendar-subscribe" class="button ghost" type="button">日历订阅</button><button id="dida-settings" class="button ghost pc-only" type="button" aria-haspopup="dialog" aria-label="滴答同步：状态未知"><span id="dida-dot" class="dida-dot" aria-hidden="true"></span>滴答同步</button><button id="lock-logout" class="button ghost" type="button">锁定退出</button></div></div>
         <button id="new-event" class="button primary">+ 新活动</button>
       </header>
       <div class="timeline-controls">
@@ -56,6 +57,7 @@
       <div id="detail" class="detail" hidden>
         <header class="detail-header">
           <button id="back-list" class="button ghost back-button">← 返回列表</button>
+          <div class="mobile-detail-actions mobile-only"><button id="mobile-sync-detail" class="compact-sync" type="button" aria-haspopup="dialog" aria-label="查看离线状态"></button><button id="mobile-more-detail" class="icon-button mobile-more" type="button" aria-label="活动更多操作" aria-haspopup="dialog"></button></div>
           <span id="compile-meta" class="meta"></span>
           <div id="dida-event-status" class="dida-event-status" role="status" aria-live="polite" hidden></div>
           <button id="delete-event" class="button ghost danger">删除活动</button>
@@ -82,6 +84,7 @@
         </details>
         <div id="cards" class="cards"></div>
         <section id="archive" class="archive"></section>
+        <footer id="mobile-compile-meta" class="mobile-only mobile-compile-meta"></footer>
       </div>
     </main>
   </div>
@@ -115,6 +118,11 @@
         <button id="editor-cancel" type="button" class="button ghost">取消</button>
       </div>
     </form>
+  </dialog>
+  <dialog id="mobile-sheet" class="mobile-sheet" aria-labelledby="mobile-sheet-title">
+    <div class="sheet-handle" aria-hidden="true"></div>
+    <header class="sheet-heading"><h2 id="mobile-sheet-title">更多操作</h2><button id="mobile-sheet-close" class="icon-button" type="button" aria-label="关闭更多操作"></button></header>
+    <div id="mobile-sheet-content" class="sheet-content"></div>
   </dialog>
   <dialog id="lightbox" class="lightbox" aria-label="全屏查看图片">
     <button id="lightbox-close" class="icon-button lightbox-close" aria-label="关闭图片">×</button>

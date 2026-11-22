@@ -2,6 +2,8 @@
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
+  "mobile-sync-list", "mobile-sync-detail", "mobile-more-list", "mobile-more-detail",
+  "mobile-sheet", "mobile-sheet-title", "mobile-sheet-close", "mobile-sheet-content", "mobile-compile-meta",
   "offline-bar", "offline-text", "refresh-cache",
   "dida-settings", "dida-dot", "dida-dialog", "dida-close", "dida-content", "dida-message", "dida-event-status",
   "toast", "toast-message", "toast-close", "new-event", "event-list", "welcome",
@@ -14,7 +16,7 @@ const ui = Object.fromEntries([
   "calendar-dialog", "calendar-content", "calendar-url", "calendar-message", "calendar-copy", "calendar-close", "calendar-subscribe",
   "field-editor", "editor-form", "editor-title", "editor-fields", "editor-help", "editor-error", "editor-save", "editor-cancel",
 ].map((id) => [id, $(id)]));
-const narrow = window.matchMedia("(max-width: 768px)");
+const narrow = window.matchMedia("(max-width: 767px)");
 const state = {
   isOffline: false, cacheSupported: false, offlineEpoch: 0, offlineMeta: null,
   offlineStatus: "unsupported", swRegistration: null, syncPromise: null, clearPromise: Promise.resolve(),
@@ -110,11 +112,13 @@ function paintOfflineStatus(mode = state.offlineStatus, message = "") {
   ui["offline-bar"].dataset.state = mode;
   const meta = state.offlineMeta;
   ui["offline-text"].textContent = message || (mode === "ready"
-    ? "已离线就绪 · 同步于 " + syncTime() + " · 已缓存 " + meta.upcomingCount + " 场即将发生 / " + meta.imageCount + " 张关键图"
+    ? "已离线就绪 · 同步于 " + syncTime() + " · 已缓存 " + (Number(meta?.upcomingCount) || 0) + " 场即将发生 / " + (Number(meta?.imageCount) || 0) + " 张关键图"
     : mode === "syncing" ? "正在同步离线缓存..."
+    : mode === "pending" ? "正在准备离线缓存…"
     : mode === "offline" ? "当前离线模式 · 正在查看本地缓存副本（同步于 " + syncTime() + "）"
     : mode === "unsupported" ? "当前环境不支持离线缓存，请使用 HTTPS 或本机 localhost / 127.0.0.1"
     : "离线同步未完成，请联网后刷新缓存");
+  paintCompactSync();
   ui["refresh-cache"].disabled = !state.authenticated || state.isOffline || !state.cacheSupported || mode === "syncing";
 }
 function enterOfflineMode() {
@@ -127,7 +131,8 @@ function enterOfflineMode() {
 function clearAllOfflineData(notify = true) {
   state.offlineEpoch++;
   state.offlineMeta = null; state.syncPromise = null;
-  for (const key of [OFFLINE_META_KEY, LOCAL_CHECKS_KEY]) {
+  dismissedNotices.clear();
+  for (const key of [OFFLINE_META_KEY, LOCAL_CHECKS_KEY, CHANGE_NOTICE_KEY]) {
     try { localStorage.removeItem(key); } catch { /* 浏览器存储不可用时不会允许离线启动。 */ }
   }
   const clear = async () => {
@@ -289,6 +294,7 @@ function setupPwa() {
   if (!state.cacheSupported) { paintOfflineStatus("unsupported"); return; }
   try { localStorage.setItem("eb_storage_probe", "1"); localStorage.removeItem("eb_storage_probe"); }
   catch { state.cacheSupported = false; paintOfflineStatus("unsupported"); return; }
+  paintOfflineStatus("pending");
   navigator.serviceWorker.addEventListener("message", event => {
     if (event.data?.type === "AUTHORIZE_PRIVATE_READ") {
       event.ports?.[0]?.postMessage({ authorized: state.authenticated && !readLocal(PENDING_LOGOUT_KEY, false) });
@@ -327,6 +333,7 @@ function updateAuthControls() {
 function showGate(message = "请先输入访问口令", clearOffline = true) {
   if (clearOffline) clearAllOfflineData();
   state.isOffline = false;
+  closeMobileSheet(); ui["mobile-compile-meta"].textContent = "";
   closeCalendarDialog(); closeDidaDialog();
   didaStatusRequest++; didaStatusPending = null; state.didaStatus = null; state.didaBusy = false; state.didaSyncing.clear();
   state.didaProjects = []; state.didaProjectsReady = false; state.didaProjectsError = "";
@@ -598,7 +605,7 @@ function renderConflicts(parent, event) {
     }
     row.append(actions);box.append(row);
   }
-  box.append(el("p","helper mobile-only","请在电脑端处理字段冲突"));parent.append(box);
+  parent.append(box);
 }
 function closeEditor() {
   if (state.busy) return;
@@ -665,9 +672,14 @@ async function saveEditor(event) {
     if(editorState===current && error.status!==401)ui["editor-error"].textContent=error.message;
   }
 }
-async function patchOverrides(payload, message, fromEditor=false) {
+async function patchOverrides(payload, message, fromEditor=false, conflictOnly=false) {
   if (state.isOffline) return;
-  if(narrow.matches||locked()||!state.event)return;
+  const conflictKey = Object.keys(payload || {});
+  const safeConflict = conflictOnly && conflictKey.length === 1 &&
+    ["unlock", "dismiss_conflicts"].includes(conflictKey[0]) &&
+    Array.isArray(payload[conflictKey[0]]) && payload[conflictKey[0]].length === 1 &&
+    list(state.event?.pending_conflicts).some(item => item.field === payload[conflictKey[0]][0]);
+  if((narrow.matches && !safeConflict)||locked()||!state.event)return;
   const id=state.selected,generation=state.authGeneration;
   state.busy=true;updateControls();ui["editor-save"].disabled=true;
   try {
@@ -831,6 +843,8 @@ function updateControls() {
   document.querySelectorAll("[data-calendar-export]").forEach(node => {
     node.disabled = writeLocked() || timestamp(presentation(state.event)?.l1_core?.start_time) === null;
   });
+  document.querySelectorAll("[data-conflict-action]").forEach(node => { node.disabled = locked(); });
+  for (const id of ["mobile-more-list", "mobile-more-detail"]) ui[id].disabled = locked();
   paintOfflineStatus(); updateDidaControls();
   ui.composer.setAttribute("aria-busy", String(locked()));
 }
@@ -898,6 +912,7 @@ function renderDetail() {
   ui["compile-meta"].textContent = event.compiled_data
     ? "最后整理 " + localTime(meta.compiled_at) + (words(meta.model) ? " · " + meta.model : "")
     : "尚未整理";
+  ui["mobile-compile-meta"].textContent = ui["compile-meta"].textContent;
   ui.composer.hidden = false;
   renderQueue();
   renderCards(event);
@@ -969,10 +984,11 @@ function renderCards(event) {
   ui.cards.replaceChildren();
   if (!presentation(event)) {
     ui.cards.append(el("div", "card empty-state",
-      "把活动通知、截图或二维码粘贴到上方，点击「保存并整理」即可生成现场卡片"));
+      narrow.matches ? "活动尚未整理，请在电脑端补充素材并整理，原始素材仍可在下方查看。" : "把活动通知、截图或二维码粘贴到上方，点击「保存并整理」即可生成现场卡片"));
     return;
   }
   const data = object(presentation(event)), core = object(data.l1_core), modules = object(data.l2_modules);
+  if (narrow.matches) { renderMobileCore(event); renderModules(event, data, modules); return; }
   const main = el("section", "card core-card");
   renderConflicts(main,event);
   main.append(el("h2", "core-title", words(core.title) || "未命名活动"));
@@ -1021,6 +1037,9 @@ function renderCards(event) {
   }
   addEditTools(main,"rules",event);
   ui.cards.append(main);
+  renderModules(event, data, modules);
+}
+function renderModules(event, data, modules) {
   if (list(modules.schedule).length) {
     const section = card("议程安排");
     for (const entry of modules.schedule) {
@@ -1076,8 +1095,10 @@ function renderArchive(event) {
   const items = list(event.raw_items);
   ui.archive.replaceChildren(el("h2", "", "原始素材档案（共 " + items.length + " 条）"));
   if (!items.length) { ui.archive.append(el("p", "helper", "暂无素材，原始通知会一直保留在这里。")); return; }
+  const gallery = narrow.matches ? el("div", "raw-gallery") : null;
+  if (gallery && items.some(item => item.type === "image")) ui.archive.append(gallery);
   for (const item of [...items].reverse()) {
-    const row = el("article", "raw-item"), header = el("div", "raw-header");
+    const row = el("article", "raw-item" + (item.type === "image" ? " raw-image-item" : "")), header = el("div", "raw-header");
     header.append(el("time", "", localTime(item.created_at)));
     if (item.type === "image") {
       let role = "图片";
@@ -1088,12 +1109,12 @@ function renderArchive(event) {
     remove.dataset.mutating = "";remove.classList.add("pc-only");
     remove.setAttribute("aria-label", "删除这条" + (item.type === "image" ? "图片" : "素材"));
     header.append(remove); row.append(header);
-    if (item.type === "image") row.append(imageButton(item, "raw-image"));
-    if (words(item.content)) {
+    if (item.type === "image") row.append(imageButton(narrow.matches ? {...item,content:"原始图片 · " + localTime(item.created_at)} : item, "raw-image"));
+    if (words(item.content) && !(narrow.matches && item.type === "image")) {
       const url = item.type === "url" ? validLink(item.content) : null;
       row.append(url ? externalLink(item.content, url, "raw-text") : el("p", "raw-text raw-caption", item.content));
     }
-    ui.archive.append(row);
+    if (gallery && item.type === "image") gallery.append(row); else ui.archive.append(row);
   }
 }
 async function refreshCurrent() {
@@ -1314,7 +1335,8 @@ narrow.addEventListener("change", () => {
     if (ui["field-editor"].open) ui["field-editor"].close();
     closeDidaDialog();
   } else if (ui["dida-dialog"].open) run(openDidaDialog);
-  ui.composer.open = !narrow.matches; renderDidaSync(); updateControls();
+  closeMobileSheet();
+  ui.composer.open = !narrow.matches; if (state.event) renderDetail(); renderList(); renderDidaSync(); updateControls();
 });
 ui["auth-form"].addEventListener("submit", (event) => { event.preventDefault(); run(() => login(event)); });
 ui["lock-logout"].addEventListener("click", () => run(logout));
@@ -1418,6 +1440,7 @@ function updateDidaControls() {
   });
 }
 function renderDidaSync() {
+  paintMobileDidaBadge();
   const region = ui["dida-event-status"], event = state.event;
   region.replaceChildren(); region.hidden = !event;
   if (!event) return;
@@ -1658,5 +1681,234 @@ async function didaWorkspaceReady() {
     if (generation === state.authGeneration && error.status !== 401 && result === "connected") toast("已收到滴答连接回执，暂时无法读取设置，请联网后重试", "warning");
   }
 }
+
+
+// Mobile presentation reuses the same event, auth and write pipeline as desktop.
+const CHANGE_NOTICE_KEY = "eb_change_notices_v1";
+const dismissedNotices = new Map();
+let sheetOpener = null;
+const iconPaths = {
+  more: "M5 12h.01M12 12h.01M19 12h.01",
+  back: "m12 5-7 7 7 7M5 12h14",
+  close: "m6 6 12 12M6 18 18 6",
+  route: "m21 3-6 18-4-8-8-4 18-6Z",
+  copy: "M9 9h11v11H9zM5 15H3V3h12v2",
+  calendar: "M4 5h16v16H4zM8 3v4m8-4v4M4 11h16",
+  refresh: "M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-2l2 3M4 16l2 3a7 7 0 0 0 12-2",
+  lock: "M5 10h14v11H5zM8 10V7a4 4 0 0 1 8 0v3",
+  check: "m5 12 4 4L19 6",
+  warning: "m12 3 10 18H2L12 3Zm0 6v5m0 3h.01",
+  info: "M12 8h.01M12 11v6M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0Z",
+  chevron: "m6 9 6 6 6-6",
+  expand: "M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5",
+};
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  for (const [key, value] of Object.entries({ viewBox:"0 0 24 24", fill:"none", stroke:"currentColor", "stroke-width":"1.8", "stroke-linecap":"round", "stroke-linejoin":"round", "aria-hidden":"true", focusable:"false" })) svg.setAttribute(key, value);
+  svg.classList.add("ui-icon");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", iconPaths[name] || iconPaths.info); svg.append(path);
+  return svg;
+}
+function touchButton(label, glyph, className, action) {
+  const node = button("", className, action);
+  node.append(icon(glyph), el("span", "", label)); return node;
+}
+function readableChange(value) {
+  if (typeof value !== "string") return valueDisplay(value);
+  return value.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})/g, raw => {
+    const ms = timestamp(raw);
+    return ms === null ? raw : new Intl.DateTimeFormat("zh-CN", {timeZone:"Asia/Shanghai", month:"long", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false}).format(ms);
+  });
+}
+function changeFingerprint(event) {
+  // Canonical fields ignore response key order and unrelated compile metadata.
+  const text = JSON.stringify(list(presentation(event)?.l1_core?.change_alerts).map(entry =>
+    [entry?.field ?? null, entry?.old_value ?? null, entry?.new_value ?? null, entry?.reason ?? null]));
+  let a = 2166136261, b = 5381;
+  for (let i = 0; i < text.length; i++) { a = Math.imul(a ^ text.charCodeAt(i), 16777619); b = Math.imul(b, 33) ^ text.charCodeAt(i); }
+  return (a >>> 0).toString(16).padStart(8,"0") + (b >>> 0).toString(16).padStart(8,"0") + ":" + text.length;
+}
+function noticeIgnored(event) {
+  const fingerprint = changeFingerprint(event), saved = object(readLocal(CHANGE_NOTICE_KEY, {}));
+  return dismissedNotices.get(event.id) === fingerprint ||
+    (Object.hasOwn(saved, event.id) && saved[event.id] === fingerprint);
+}
+function dismissChanges(event) {
+  if (!state.authenticated || event.id !== state.selected) return;
+  const fingerprint = changeFingerprint(event), saved = object(readLocal(CHANGE_NOTICE_KEY, {}));
+  dismissedNotices.set(event.id, fingerprint);
+  Object.defineProperty(saved, event.id, {value:fingerprint, enumerable:true, configurable:true, writable:true});
+  try { writeLocal(CHANGE_NOTICE_KEY, saved); toast("已隐藏这次变更提醒，可在更多菜单中查看"); }
+  catch { toast("已暂时隐藏提醒；浏览器未允许保存已读状态", "warning"); }
+  renderCards(state.event);
+  updateControls();
+}
+function appendChanges(parent, event) {
+  for (const entry of list(presentation(event)?.l1_core?.change_alerts)) {
+    const item = object(entry), row = el("div", "notice-entry");
+    row.append(el("h3", "", fieldNames[item.field] || words(item.field) || "活动信息"),
+      el("p", "change-before", "此前 · " + readableChange(item.old_value)),
+      el("p", "change-after", "现在 · " + readableChange(item.new_value)));
+    if (words(item.reason)) row.append(el("p", "helper", item.reason));
+    parent.append(row);
+  }
+}
+async function resolveMobileConflict(field, decision) {
+  if (state.isOffline) { toast("离线状态下暂无法提交，联网后可一键处理", "warning"); return; }
+  if (locked() || !list(state.event?.pending_conflicts).some(item => item.field === field)) return;
+  if (!['keep','ai'].includes(decision)) return;
+  await patchOverrides(decision === "ai" ? {unlock:[field]} : {dismiss_conflicts:[field]}, "已解决冲突", false, true);
+}
+function renderMobileNotices(event) {
+  const wrap = el("div", "mobile-notices"), conflicts = list(event.pending_conflicts);
+  if (conflicts.length) {
+    const details = el("details", "notice notice-conflict"), summary = el("summary", "notice-summary");
+    summary.append(icon("warning"), el("span", "", "有 " + conflicts.length + " 项字段冲突待确认"), el("span", "notice-prompt", "去处理"), icon("chevron"));
+    details.append(summary);
+    const body = el("div", "notice-body");
+    for (const conflict of conflicts) {
+      const row = el("div", "notice-entry");
+      row.append(el("h3", "", words(conflict.label) || "字段"),
+        el("p", "conflict-value", "我的锁定值\n" + readableChange(conflict.current_value)),
+        el("p", "conflict-value", "AI 最新值\n" + readableChange(conflict.ai_value)));
+      const actions = el("div", "conflict-actions");
+      const keep = touchButton("保留我的锁定值", "lock", "secondary", () => resolveMobileConflict(conflict.field, "keep"));
+      const accept = touchButton("采用 AI 最新值", "check", "primary", () => resolveMobileConflict(conflict.field, "ai"));
+      for (const action of [keep, accept]) { action.dataset.conflictAction = ""; action.disabled = locked(); actions.append(action); }
+      row.append(actions); body.append(row);
+    }
+    details.append(body); wrap.append(details);
+  }
+  if (list(presentation(event)?.l1_core?.change_alerts).length && !noticeIgnored(event)) {
+    const row = el("div", "notice-change-row"), details = el("details", "notice notice-change"), summary = el("summary", "notice-summary");
+    summary.append(icon("info"), el("span", "", "活动信息有最新变更"), el("span", "notice-prompt", "查看"), icon("chevron"));
+    details.append(summary);
+    const body = el("div", "notice-body"); appendChanges(body, event);
+    body.append(touchButton("我知道了，隐藏提示", "check", "secondary", () => dismissChanges(event)));
+    details.append(body);
+    const dismiss = touchButton("", "close", "notice-dismiss", () => dismissChanges(event));
+    dismiss.setAttribute("aria-label", "隐藏最新变更提醒"); dismiss.title = "隐藏本次变更提醒";
+    row.append(details, dismiss); wrap.append(row);
+  }
+  if (wrap.childElementCount) ui.cards.append(wrap);
+}
+function mobileDidaBadge(event) {
+  const status = event.dida_sync?.status;
+  const label = status === "synced" ? "已同步滴答" : status === "failed" ? "滴答同步失败" : status === "skipped_no_time" ? "无时间·未推滴答" : state.didaStatus?.connected ? "未同步滴答" : "";
+  const node = el("span", "badge dida-badge " + (status === "synced" ? "dida-synced" : status === "failed" ? "dida-failed" : ""), label);
+  node.hidden = !label;
+  node.title = status === "synced" ? "同步于 " + localTime(event.dida_sync.synced_at) : status === "failed" ? didaErrorText(event.dida_sync.last_error) : label;
+  return node;
+}
+function paintMobileDidaBadge() {
+  const target = document.getElementById("mobile-dida-badge");
+  if (target && state.event) target.replaceChildren(mobileDidaBadge(state.event));
+}
+function renderMobileCore(event) {
+  const core = object(presentation(event)?.l1_core), hero = el("section", "card mobile-hero");
+  const heading = el("div", "hero-heading"), badge = el("span", "mobile-dida-slot"); badge.id = "mobile-dida-badge";
+  badge.append(mobileDidaBadge(event));
+  heading.append(el("h2", "core-title", words(core.title) || "未命名活动"), badge); hero.append(heading);
+  const time = el("div", "hero-time");
+  time.append(el("p", "", words(core.time_display) || "时间待定"), countdownBadge(core, event)); hero.append(time);
+  const name = words(core.location_name), address = words(core.location_address), full = [name,address].filter(Boolean).join(" ");
+  if (name || address) {
+    const location = el("div", "hero-location");
+    if (name) location.append(el("p", "location-name", name));
+    if (address) location.append(el("p", "location-address", address));
+    hero.append(location);
+  }
+  const actions = el("div", "hero-actions");
+  if (full) {
+    const nav = externalLink("", "https://uri.amap.com/search?keyword=" + encodeURIComponent(full), "button primary");
+    nav.append(icon("route"), el("span", "", "高德导航"));
+    actions.append(nav, touchButton("复制地址", "copy", "secondary", () => copyText(full)));
+  }
+  const calendar = touchButton("导出 .ics", "calendar", "secondary", exportCalendar);
+  calendar.dataset.calendarExport = "";
+  calendar.title = timestamp(core.start_time) === null ? "时间待定，明确时间后可导出" : "导出到系统日历";
+  actions.append(calendar); hero.append(actions); ui.cards.append(hero);
+  renderMobileNotices(event);
+  const credentials = [...new Set(list(core.credential_item_ids))].map(id => list(event.raw_items).find(item => item.id === id && item.type === "image" && imageUrl(item))).filter(Boolean);
+  if (credentials.length) {
+    const section = card("入场凭证 / 签到码"); section.classList.add("credential-card");
+    for (const [index, item] of credentials.entries()) {
+      const image = imageButton({...item,content:"入场凭证 " + (index + 1)}, "credential-image");
+      const action = touchButton(credentials.length > 1 ? "全屏亮码 · 凭证 " + (index + 1) : "一键亮码", "expand", "primary credential-open", () => openImage(imageUrl(item), "入场凭证 " + (index + 1)));
+      section.append(image, action);
+    }
+    ui.cards.append(section);
+  }
+  if (list(core.must_know).length) { const rules = card("入场前务必确认"); rules.classList.add("mobile-rules"); addTags(rules, core.must_know); ui.cards.append(rules); }
+}
+function paintCompactSync() {
+  const mode = state.offlineStatus, label = mode === "ready" ? "离线就绪" : mode === "syncing" ? "同步中" : mode === "pending" ? "准备缓存" : mode === "offline" ? "离线副本" : mode === "unsupported" ? "离线未就绪" : "待同步";
+  for (const id of ["mobile-sync-list", "mobile-sync-detail"]) {
+    const node = ui[id]; node.dataset.state = mode;
+    node.replaceChildren(el("span", "sync-dot"), el("span", "", label));
+    node.setAttribute("aria-label", label + "，查看缓存状态"); node.disabled = !state.authenticated;
+  }
+}
+function closeMobileSheet() { if (ui["mobile-sheet"].open) ui["mobile-sheet"].close(); }
+function openMobileSheet(view = "menu", opener = null) {
+  if (!state.authenticated || !narrow.matches) return;
+  sheetOpener = opener || document.activeElement;
+  const content = ui["mobile-sheet-content"]; content.replaceChildren();
+  ui["mobile-sheet-title"].textContent = view === "sync" ? "离线缓存" : view === "changes" ? "已忽略的变更提醒" : view === "logout" ? "锁定看板" : "更多操作";
+  if (view === "sync") {
+    const meta = state.offlineMeta;
+    content.append(el("p", "sheet-description", ui["offline-text"].textContent),
+      el("p", "helper", meta ? "上次同步 " + localTime(meta.lastSyncAt) + " · " + (Number(meta.upcomingCount)||0) + " 场活动 · " + (Number(meta.imageCount)||0) + " 张关键图" : "联网后同步，即可在现场离线查看已缓存的活动和凭证。"));
+    const refresh = touchButton("刷新缓存", "refresh", "primary sheet-action", refreshMobileCache);
+    refresh.disabled = state.isOffline || !state.cacheSupported || state.offlineStatus === "syncing"; content.append(refresh);
+  } else if (view === "changes") {
+    if (state.event && list(presentation(state.event)?.l1_core?.change_alerts).length) {
+      appendChanges(content, state.event);
+      content.append(touchButton("重新显示提醒", "refresh", "secondary sheet-action", () => {
+        const saved = object(readLocal(CHANGE_NOTICE_KEY, {})); delete saved[state.event.id]; dismissedNotices.delete(state.event.id);
+        try { writeLocal(CHANGE_NOTICE_KEY, saved); } catch { toast("浏览器未允许保存，重新打开时可能仍隐藏", "warning"); }
+        closeMobileSheet(); renderCards(state.event); updateControls();
+      }));
+    } else content.append(el("p", "sheet-description", "当前活动没有变更提醒。"));
+  } else if (view === "logout") {
+    content.append(el("p", "sheet-description", "锁定后会清除本机私密活动缓存。下次打开需重新输入访问口令。"));
+    content.append(touchButton("确认锁定并清理缓存", "lock", "secondary danger sheet-action", async () => { closeMobileSheet(); await logout(); }),
+      touchButton("继续查看", "back", "secondary sheet-action", closeMobileSheet));
+  } else {
+    if (state.event) {
+      const exp = touchButton("导出日程 .ics", "calendar", "secondary sheet-action", () => { closeMobileSheet(); return exportCalendar(); });
+      exp.dataset.calendarExport = ""; content.append(exp);
+      content.append(touchButton("查看已忽略的变更提醒", "info", "secondary sheet-action", () => openMobileSheet("changes", sheetOpener)));
+    }
+    const subscription = touchButton("日历订阅", "calendar", "secondary sheet-action", () => { closeMobileSheet(); return openCalendarDialog(); });
+    subscription.disabled = state.isOffline; content.append(subscription,
+      touchButton("离线状态与刷新缓存", "refresh", "secondary sheet-action", () => openMobileSheet("sync", sheetOpener)),
+      touchButton("锁定退出", "lock", "secondary danger sheet-action", () => openMobileSheet("logout", sheetOpener)));
+    if (state.event) content.append(el("p", "helper sheet-meta", ui["compile-meta"].textContent));
+  }
+  if (!ui["mobile-sheet"].open) ui["mobile-sheet"].showModal();
+  updateControls(); ui["mobile-sheet-close"].focus();
+}
+async function refreshMobileCache() {
+  if (state.isOffline) { toast("请联网后刷新缓存", "warning"); return; }
+  closeMobileSheet(); await syncUpcomingOfflineCache([], true);
+}
+function setupMobileControls() {
+  for (const id of ["mobile-more-list", "mobile-more-detail"]) {
+    ui[id].append(icon("more")); ui[id].addEventListener("click", () => openMobileSheet("menu", ui[id]));
+  }
+  for (const id of ["mobile-sync-list", "mobile-sync-detail"]) ui[id].addEventListener("click", () => openMobileSheet("sync", ui[id]));
+  ui["back-list"].replaceChildren(icon("back"), el("span", "", "返回"));
+  ui["mobile-sheet-close"].append(icon("close"));
+  ui["lightbox-close"].replaceChildren(icon("close"));
+  ui["mobile-sheet-close"].addEventListener("click", closeMobileSheet);
+  ui["mobile-sheet"].addEventListener("click", event => { if (event.target === ui["mobile-sheet"]) closeMobileSheet(); });
+  ui["mobile-sheet"].addEventListener("close", () => {
+    ui["mobile-sheet-content"].replaceChildren();
+    if (state.authenticated) sheetOpener?.focus(); sheetOpener = null;
+  });
+}
+setupMobileControls();
 
 run(init);

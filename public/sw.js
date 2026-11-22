@@ -1,5 +1,5 @@
 "use strict";
-const SHELL_CACHE = "eb-shell-v3";
+const SHELL_CACHE = "eb-shell-v4";
 const PRIVATE_CACHE = "eb-private-v1";
 const SHELL_ASSETS = ["/", "/styles.css", "/app.js", "/manifest.json", "/icon.svg", "/icon-192.png", "/icon-512.png"];
 let privateEpoch = 0;
