@@ -33,7 +33,7 @@
     <div id="offline-bar" class="offline-bar" data-state="unsupported" role="status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="offline-text">正在准备离线缓存…</span><button id="refresh-cache" class="button ghost" type="button">刷新缓存</button></div>
     <aside id="sidebar" class="sidebar" aria-label="活动列表">
       <header class="sidebar-header">
-        <div class="sidebar-brand"><h1>Event Board</h1><div class="sidebar-actions"><button id="calendar-subscribe" class="button ghost" type="button">日历订阅</button><button id="lock-logout" class="button ghost" type="button">锁定退出</button></div></div>
+        <div class="sidebar-brand"><h1>Event Board</h1><div class="sidebar-actions"><button id="calendar-subscribe" class="button ghost" type="button">日历订阅</button><button id="dida-settings" class="button ghost pc-only" type="button" aria-haspopup="dialog" aria-label="滴答同步：状态未知"><span id="dida-dot" class="dida-dot" aria-hidden="true"></span>滴答同步</button><button id="lock-logout" class="button ghost" type="button">锁定退出</button></div></div>
         <button id="new-event" class="button primary">+ 新活动</button>
       </header>
       <div class="timeline-controls">
@@ -57,6 +57,7 @@
         <header class="detail-header">
           <button id="back-list" class="button ghost back-button">← 返回列表</button>
           <span id="compile-meta" class="meta"></span>
+          <div id="dida-event-status" class="dida-event-status" role="status" aria-live="polite" hidden></div>
           <button id="delete-event" class="button ghost danger">删除活动</button>
         </header>
         <div id="detail-loading" class="empty-state" role="status" hidden>正在读取活动…</div>
@@ -84,6 +85,11 @@
       </div>
     </main>
   </div>
+  <dialog id="dida-dialog" class="calendar-dialog dida-dialog" aria-labelledby="dida-title">
+    <div class="calendar-heading"><h2 id="dida-title">滴答清单同步设置</h2><button id="dida-close" class="icon-button" type="button" aria-label="关闭滴答同步设置">×</button></div>
+    <p id="dida-message" class="dida-message" role="status" aria-live="polite"></p>
+    <div id="dida-content" class="dida-content"></div>
+  </dialog>
   <dialog id="calendar-dialog" class="calendar-dialog" aria-labelledby="calendar-title">
     <div class="calendar-heading"><h2 id="calendar-title">日历订阅</h2><button id="calendar-close" class="icon-button" type="button" aria-label="关闭日历订阅">×</button></div>
     <p id="calendar-message" class="auth-message" role="status" aria-live="polite"></p>

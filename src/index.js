@@ -1,10 +1,15 @@
 import { buildCalendarFeed, buildSingleEventIcs } from "./calendar.js";
+import {
+  getDidaStatus, authorizeDida, handleDidaCallback, getDidaProjects, saveDidaConfig,
+  disconnectDida, didaSyncSummary, syncEventToDida, deleteDidaEventTask,
+} from "./dida.js";
 import { isAuthConfigured, requireAuthConfigured, verifyToken, isAuthenticated,
   createSessionCookie, clearSessionCookie, isCalendarTokenConfigured, verifyCalendarToken } from "./auth.js";
 import { compileEvent } from "./compiler.js";
 import {
   listEvents, createEvent, getEventDetail, deleteEvent,
   addTextOrUrlItem, addImageItem, deleteRawItem, getImageObject, updateEventOverrides,
+  getEventSync, listEventSyncs,
 } from "./storage.js";
 
 function decodePath(value) {
@@ -27,6 +32,32 @@ function jsonResponse(data, status = 200, headers = {}) {
       ...headers,
     },
   });
+}
+
+async function integrationBody(request) {
+  try { return await request.json(); }
+  catch { throw Object.assign(new Error("JSON 格式损坏"), { status: 400 }); }
+}
+async function attachDidaSummaries(env, events) {
+  let records = [];
+  try { records = await listEventSyncs(env.DB); }
+  catch { console.warn("[dida] 暂时无法读取同步摘要，请确认已执行增量迁移"); }
+  const byId = new Map(records.map(record => [record.event_id, record]));
+  return events.map(event => ({ ...event, dida_sync: didaSyncSummary(byId.get(event.id)) }));
+}
+async function attachDidaSummary(env, event) {
+  if (!event) return null;
+  let record = null;
+  try { record = await getEventSync(env.DB, event.id); }
+  catch { console.warn("[dida] 暂时无法读取同步摘要，请确认已执行增量迁移"); }
+  return { ...event, dida_sync: didaSyncSummary(record) };
+}
+async function isolatedDidaSync(env, event, request, force = false) {
+  try { return await syncEventToDida(env, event, request, { force }); }
+  catch {
+    console.warn("[dida] 同步失败，已保留看板修改");
+    return didaSyncSummary({ sync_status: "failed", last_error: "滴答同步失败，请稍后重试" });
+  }
 }
 
 export default {
@@ -72,13 +103,47 @@ export default {
           "Cache-Control": "private, no-cache, no-store, must-revalidate",
         } });
       }
-      const protectedPath = url.pathname === "/api/events" || url.pathname.startsWith("/api/events/") ||
+      const protectedPath = url.pathname === "/api/integrations/dida" || url.pathname.startsWith("/api/integrations/dida/") ||
+        url.pathname === "/api/events" || url.pathname.startsWith("/api/events/") ||
         url.pathname === "/api/cal/info" || url.pathname === "/api/images" || url.pathname.startsWith("/api/images/");
       if (protectedPath && !await isAuthenticated(request, env)) {
+        if (url.pathname === "/api/integrations/dida/callback") {
+          console.error("[dida callback]", { reason: "unauthorized", status: 401, detail: "本地登录会话缺失或已失效" });
+        }
         return jsonResponse({ ok: false, error: "请先输入访问口令" }, 401);
       }
 
   
+      if (url.pathname === "/api/integrations/dida/status" && request.method === "GET") {
+        return jsonResponse(await getDidaStatus(env));
+      }
+      if (url.pathname === "/api/integrations/dida/authorize" && request.method === "POST") {
+        const { authorize_url, cookie } = authorizeDida(request, env);
+        return jsonResponse({ ok: true, authorize_url }, 200, { "Set-Cookie": cookie });
+      }
+      if (url.pathname === "/api/integrations/dida/callback" && request.method === "GET") {
+        return await handleDidaCallback(request, env, ({ reason, status, detail }) => {
+          console.error("[dida callback]", { reason, status, detail });
+        });
+      }
+      if (url.pathname === "/api/integrations/dida/projects" && request.method === "GET") {
+        return jsonResponse({ ok: true, projects: await getDidaProjects(env) });
+      }
+      if (url.pathname === "/api/integrations/dida/config" && request.method === "PUT") {
+        await saveDidaConfig(env, await integrationBody(request));
+        return jsonResponse({ ok: true });
+      }
+      if (url.pathname === "/api/integrations/dida/disconnect" && request.method === "POST") {
+        await disconnectDida(env);
+        return jsonResponse({ ok: true });
+      }
+      const didaSyncMatch = url.pathname.match(/^\/api\/events\/([^/]+)\/sync\/dida$/);
+      if (didaSyncMatch && request.method === "POST") {
+        const event = await getEventDetail(env, decodePath(didaSyncMatch[1]));
+        if (!event) return jsonResponse({ ok: false, error: "活动不存在" }, 404);
+        return jsonResponse({ ok: true, dida_sync: await isolatedDidaSync(env, event, request, true) });
+      }
+
       if (url.pathname === "/api/cal/info" && request.method === "GET") {
         const configured = isCalendarTokenConfigured(env);
         return jsonResponse({ ok: true, configured,
@@ -135,18 +200,21 @@ export default {
         let body;
         try { body = await request.json(); }
         catch { return jsonResponse({ ok: false, error: "JSON 格式损坏" }, 400); }
-        return jsonResponse({ ok: true, event: await updateEventOverrides(env, decodePath(overridesMatch[1]), body) });
+        const event = await updateEventOverrides(env, decodePath(overridesMatch[1]), body);
+        const dida_sync = await isolatedDidaSync(env, event, request);
+        return jsonResponse({ ok: true, event: { ...event, dida_sync }, dida_sync });
       }
 
       const compileMatch = url.pathname.match(/^\/api\/events\/([^/]+)\/compile$/);
       if (compileMatch && request.method === "POST") {
         const { event, stats } = await compileEvent(env, decodePath(compileMatch[1]));
-        return jsonResponse({ ok: true, event, stats });
+        const dida_sync = await isolatedDidaSync(env, event, request);
+        return jsonResponse({ ok: true, event: { ...event, dida_sync }, stats, dida_sync });
       }
 
       const eventsPath = url.pathname === "/api/events";
       if (eventsPath && request.method === "GET") {
-        const events = await listEvents(env);
+        const events = await attachDidaSummaries(env, await listEvents(env));
         const upcoming = events.filter((event) => event.timeline_bucket === "upcoming");
         const archived = events.filter((event) => event.timeline_bucket === "archived");
         return jsonResponse({ ok: true, events, upcoming, archived });
@@ -159,12 +227,14 @@ export default {
       if (eventMatch) {
         const eventId = decodePath(eventMatch[1]);
         if (request.method === "GET") {
-          const event = await getEventDetail(env, eventId);
+          const event = await attachDidaSummary(env, await getEventDetail(env, eventId));
           return event
             ? jsonResponse({ ok: true, event })
             : jsonResponse({ ok: false, error: "活动不存在" }, 404);
         }
         if (request.method === "DELETE") {
+          try { await deleteDidaEventTask(env, eventId); }
+          catch { console.warn("[dida] 撤回任务失败，继续删除看板活动"); }
           return await deleteEvent(env, eventId)
             ? jsonResponse({ ok: true, deleted: true })
             : jsonResponse({ ok: false, error: "活动不存在" }, 404);
@@ -237,9 +307,11 @@ export default {
     } catch (err) {
       const status = Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599
         ? err.status : 500;
+      const didaRoute = new URL(request.url).pathname.startsWith("/api/integrations/dida/");
       return jsonResponse({
         ok: false,
-        error: err?.message || "请求处理失败",
+        error: didaRoute && !err?.didaSafe
+          ? "滴答配置处理失败，请确认已执行增量迁移" : err?.message || "请求处理失败",
       }, status);
     }
   },

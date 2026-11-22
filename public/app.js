@@ -3,6 +3,7 @@
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   "offline-bar", "offline-text", "refresh-cache",
+  "dida-settings", "dida-dot", "dida-dialog", "dida-close", "dida-content", "dida-message", "dida-event-status",
   "toast", "toast-message", "toast-close", "new-event", "event-list", "welcome",
   "detail", "back-list", "compile-meta", "delete-event", "detail-loading",
   "composer", "material-text", "choose-images", "image-files", "image-queue",
@@ -19,7 +20,8 @@ const state = {
   offlineStatus: "unsupported", swRegistration: null, syncPromise: null, clearPromise: Promise.resolve(),
   events: [], selected: null, event: null, drafts: new Map(),
   authenticated: false, authConfigured: null, authBusy: false, authGeneration: 0,
-  activeTab: "upcoming", archiveQuery: "",
+  activeTab: "upcoming", archiveQuery: "", deepLinkPending: true,
+  didaStatus: null, didaBusy: false, didaProjects: [], didaProjectsReady: false, didaProjectsError: "", didaSyncing: new Set(),
   busy: false, preparing: 0, loading: false, sequence: 0, listSequence: 0, toastTimer: null,
 };
 const fieldNames = {
@@ -119,7 +121,7 @@ function enterOfflineMode() {
   if (!state.authenticated) return;
   state.isOffline = true;
   if (ui["field-editor"].open) ui["field-editor"].close();
-  closeCalendarDialog();
+  closeCalendarDialog(); closeDidaDialog();
   paintOfflineStatus("offline"); updateControls();
 }
 function clearAllOfflineData(notify = true) {
@@ -178,7 +180,9 @@ async function tryOfflineBoot() {
   await swMessage("ENABLE_PRIVATE_CACHE", true);
   if (epoch !== state.offlineEpoch || !state.authenticated) return false;
   renderList(); paintOfflineStatus("offline"); updateControls();
-  if (available.length) await selectEvent(available[0].id);
+  const located = await locateEventFromUrl();
+  if (!located && available.length) await selectEvent(available[0].id);
+  run(didaWorkspaceReady);
   return true;
 }
 async function fetchForSync(path, epoch, generation) {
@@ -323,7 +327,11 @@ function updateAuthControls() {
 function showGate(message = "请先输入访问口令", clearOffline = true) {
   if (clearOffline) clearAllOfflineData();
   state.isOffline = false;
-  closeCalendarDialog();
+  closeCalendarDialog(); closeDidaDialog();
+  didaStatusRequest++; didaStatusPending = null; state.didaStatus = null; state.didaBusy = false; state.didaSyncing.clear();
+  state.didaProjects = []; state.didaProjectsReady = false; state.didaProjectsError = "";
+  state.deepLinkPending = true;
+  ui["dida-event-status"].replaceChildren(); ui["dida-event-status"].hidden = true;
   state.busy = false; closeEditor();
   state.authGeneration++;
   state.authenticated = false;
@@ -398,7 +406,12 @@ async function enterWorkspace() {
   ui["auth-token"].value = ""; ui["auth-message"].textContent = "";
   ui["auth-gate"].hidden = true; ui.workspace.hidden = false;
   renderList(); updateControls();
-  try { await loadList(); if (state.selected && state.event) await refreshCurrent(); }
+  try {
+    const hadSelection = Boolean(state.selected && state.event);
+    await loadList();
+    if (hadSelection && state.selected && state.event) await refreshCurrent();
+    if (state.authenticated && workspaceGeneration === state.authGeneration) run(didaWorkspaceReady);
+  }
   catch (error) {
     if (!state.authenticated || error.status === 401) return;
     ui["event-list"].replaceChildren(el("p", "empty-state", error.message),
@@ -453,6 +466,7 @@ async function logout() {
   state.authBusy = true;
   const wasOffline = state.isOffline || navigator.onLine === false;
   try { writeLocal(PENDING_LOGOUT_KEY, true); } catch { /* 同步清缓存仍然执行。 */ }
+  setEventUrl(null);
   showGate("正在安全退出…");
   try {
     await state.clearPromise;
@@ -657,16 +671,17 @@ async function patchOverrides(payload, message, fromEditor=false) {
   const id=state.selected,generation=state.authGeneration;
   state.busy=true;updateControls();ui["editor-save"].disabled=true;
   try {
-    const {event}=await apiFetch(eventPath(id)+"/overrides",{
+    const result=await apiFetch(eventPath(id)+"/overrides",{
       method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload),
     });
     if(generation!==state.authGeneration||id!==state.selected)return;
+    const event = { ...result.event, dida_sync: result.dida_sync ?? result.event.dida_sync ?? null };
     state.event=event;state.activeTab=event.timeline_bucket==="archived"?"archived":"upcoming";
     state.events=state.events.map(item=>item.id===id?{...event,raw_count:list(event.raw_items).length}:item);
     state.busy=false;
     if(fromEditor)closeEditor();
     state.busy=true;
-    renderDetail();renderList();toast(message);
+    renderDetail();renderList();didaSavedNotice(event.dida_sync,message);
     try{await loadList()}catch(error){if(error.status!==401)toast("字段已保存，列表刷新失败，可稍后重试","warning")}
   } catch(error) {
     if(!fromEditor&&error.status!==401)toast(error.message,"error");
@@ -789,6 +804,7 @@ async function loadList() {
   if (token !== state.listSequence) return;
   state.events = list(data.events);
   renderList();
+  await locateEventFromUrl();
   if (!state.isOffline) syncUpcomingOfflineCache(state.events.filter(event => event.timeline_bucket === "upcoming"));
 }
 function updateControls() {
@@ -815,7 +831,7 @@ function updateControls() {
   document.querySelectorAll("[data-calendar-export]").forEach(node => {
     node.disabled = writeLocked() || timestamp(presentation(state.event)?.l1_core?.start_time) === null;
   });
-  paintOfflineStatus();
+  paintOfflineStatus(); updateDidaControls();
   ui.composer.setAttribute("aria-busy", String(locked()));
 }
 function renderQueue() {
@@ -839,8 +855,10 @@ function renderQueue() {
 }
 async function selectEvent(id, focusInput = false) {
   if (locked()) return;
-  state.selected = id;
-  state.event = null;
+  state.selected = id; setEventUrl(id);
+  const summary = state.events.find(event => event.id === id);
+  if (summary) state.activeTab = summary.timeline_bucket === "archived" ? "archived" : "upcoming";
+  state.event = null; renderDidaSync();
   state.loading = true;
   const token = ++state.sequence;
   document.body.classList.add("detail-open");
@@ -883,7 +901,7 @@ function renderDetail() {
   ui.composer.hidden = false;
   renderQueue();
   renderCards(event);
-  renderArchive(event);
+  renderArchive(event); renderDidaSync();
   updateControls();
 }
 function card(title) {
@@ -1122,7 +1140,7 @@ async function deleteEvent() {
     state.drafts.delete(id);
     state.listSequence++;
     state.events = state.events.filter((item) => item.id !== id);
-    state.event = null; state.selected = null; state.sequence++;
+    state.event = null; state.selected = null; state.sequence++; setEventUrl(null); renderDidaSync();
     ui.detail.hidden = true; ui.welcome.hidden = false;
     document.body.classList.remove("detail-open");
     renderList();
@@ -1160,12 +1178,13 @@ async function persist(compile) {
     ui["material-text"].value = ""; renderQueue();
     if (compile) {
       status("正在调用百炼 AI 整理中，约需 3~10 秒…");
-      const { event, stats } = await apiFetch(eventPath(id) + "/compile", { method: "POST" });
+      const result = await apiFetch(eventPath(id) + "/compile", { method: "POST" });
+      const event = { ...result.event, dida_sync: result.dida_sync ?? result.event.dida_sync ?? null }, stats = result.stats;
       state.event = event; renderDetail();
       status("整理完成");
       const isArchived = event.timeline_bucket === "archived";
       state.activeTab = isArchived ? "archived" : "upcoming";
-      toast(isArchived ? "该活动时间已过，已自动归入「历史归档」" :
+      didaSavedNotice(event.dida_sync, isArchived ? "该活动时间已过，已自动归入「历史归档」" :
         "整理完成" + (stats ? " · 新分析 " + stats.newly_analyzed_images + " 张图片" : ""), isArchived ? "warning" : "success");
       if (narrow.matches) { ui.composer.open = false; ui.cards.scrollIntoView({ block: "start" }); }
     } else {
@@ -1277,8 +1296,8 @@ ui.composer.addEventListener("drop", (event) => {
 });
 ui["back-list"].addEventListener("click", () => {
   if (locked()) return;
-  document.body.classList.remove("detail-open");
-  ui["new-event"].focus();
+  clearSelection();
+  ui["upcoming-tab"].focus();
 });
 ui["toast-close"].addEventListener("click", () => { ui.toast.hidden = true; });
 ui["lightbox-image"].addEventListener("error", () => run(checkImageAuth));
@@ -1290,7 +1309,13 @@ ui.lightbox.addEventListener("close", () => {
   document.body.classList.remove("lightbox-open");
   ui["lightbox-image"].removeAttribute("src");
 });
-narrow.addEventListener("change", () => { if(narrow.matches && ui["field-editor"].open)ui["field-editor"].close();ui.composer.open = !narrow.matches; });
+narrow.addEventListener("change", () => {
+  if (narrow.matches) {
+    if (ui["field-editor"].open) ui["field-editor"].close();
+    closeDidaDialog();
+  } else if (ui["dida-dialog"].open) run(openDidaDialog);
+  ui.composer.open = !narrow.matches; renderDidaSync(); updateControls();
+});
 ui["auth-form"].addEventListener("submit", (event) => { event.preventDefault(); run(() => login(event)); });
 ui["lock-logout"].addEventListener("click", () => run(logout));
 for (const tab of ["upcoming", "archived"]) {
@@ -1322,6 +1347,11 @@ ui["editor-form"].addEventListener("submit",event=>{event.preventDefault();run((
 ui["editor-cancel"].addEventListener("click",closeEditor);
 ui["field-editor"].addEventListener("cancel",event=>{if(state.busy)event.preventDefault();else closeEditor()});
 ui["field-editor"].addEventListener("close",()=>{editorState=null;ui["editor-fields"].replaceChildren();ui["editor-error"].textContent=""});
+ui["dida-settings"].addEventListener("click", () => run(openDidaDialog));
+ui["dida-close"].addEventListener("click", closeDidaDialog);
+ui["dida-dialog"].addEventListener("close", () => {
+  didaDialogRequest++; ui["dida-content"].replaceChildren(); ui["dida-message"].textContent = "";
+});
 ui["calendar-subscribe"].addEventListener("click", () => run(openCalendarDialog));
 ui["calendar-close"].addEventListener("click", closeCalendarDialog);
 ui["calendar-dialog"].addEventListener("close", () => {
@@ -1339,4 +1369,294 @@ window.addEventListener("online", () => {
   if (state.authBusy) return;
   run(checkAuth);
 });
+function setEventUrl(id) {
+  const url = new URL(window.location.href);
+  url.pathname = "/";
+  if (id) url.searchParams.set("event", id); else url.searchParams.delete("event");
+  history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+}
+async function locateEventFromUrl() {
+  if (!state.deepLinkPending || locked()) return false;
+  state.deepLinkPending = false;
+  const id = new URL(window.location.href).searchParams.get("event");
+  if (!id) return false;
+  const event = state.events.find(item => item.id === id);
+  if (!event) { toast("链接中的活动不存在或当前列表尚未缓存该活动", "warning"); return true; }
+  state.activeTab = event.timeline_bucket === "archived" ? "archived" : "upcoming";
+  state.archiveQuery = ""; ui["archive-search"].value = "";
+  await selectEvent(id);
+  return true;
+}
+function clearSelection() {
+  state.sequence++; state.selected = null; state.event = null; state.loading = false;
+  ui.detail.hidden = true; ui.welcome.hidden = false; ui["detail-loading"].hidden = true;
+  ui.cards.replaceChildren(); ui.archive.replaceChildren();
+  ui["dida-event-status"].replaceChildren(); ui["dida-event-status"].hidden = true;
+  document.body.classList.remove("detail-open");
+  setEventUrl(null); renderList(); updateControls();
+}
+const DIDA_ROOT = "/api/integrations/dida";
+let didaStatusRequest = 0, didaDialogRequest = 0, didaStatusPending = null;
+function didaErrorText(value) {
+  return words(value).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=-]+/gi, "[已脱敏]")
+    .replace(/((?:access_token|refresh_token|client_secret)["']?\s*[:=]\s*)["']?[^\s,"'<>}&]+/gi, "$1[已脱敏]")
+    .replace(/sk-[A-Za-z0-9_.-]+/g, "[已脱敏]").slice(0, 200);
+}
+function updateDidaControls() {
+  const disabled = !state.authenticated || state.isOffline || state.didaBusy || narrow.matches;
+  ui["dida-settings"].disabled = !state.authenticated || state.isOffline;
+  const connected = state.didaStatus?.connected === true;
+  ui["dida-dot"].classList.toggle("connected", connected);
+  ui["dida-settings"].setAttribute("aria-label", "滴答同步：" + (connected ? "已连接" : "未连接或状态未知"));
+  ui["dida-settings"].title = state.isOffline ? "联网后管理滴答连接" : connected ? "滴答清单已连接" : "设置滴答清单同步";
+  ui["dida-dialog"].setAttribute("aria-busy", String(state.didaBusy));
+  ui["dida-content"].querySelectorAll("[data-dida-action]").forEach(node => {
+    node.disabled = disabled || (node.dataset.requiresProjects === "true" && !state.didaProjectsReady);
+  });
+  document.querySelectorAll("[data-dida-sync]").forEach(node => {
+    node.disabled = writeLocked() || state.loading || narrow.matches || !connected || state.didaBusy || state.didaSyncing.has(state.selected);
+  });
+}
+function renderDidaSync() {
+  const region = ui["dida-event-status"], event = state.event;
+  region.replaceChildren(); region.hidden = !event;
+  if (!event) return;
+  const sync = event.dida_sync, connected = state.didaStatus?.connected === true;
+  const status = sync?.status;
+  const label = status === "synced" ? "已同步滴答" : status === "skipped_no_time" ? "无时间·未推滴答"
+    : status === "failed" ? "滴答同步失败" : connected ? "未同步滴答" : "";
+  if (!label) { region.hidden = true; return; }
+  const badge = el("span", "badge dida-badge " + (status === "synced" ? "dida-synced" : status === "failed" ? "dida-failed" : ""), label);
+  if (status === "synced" && sync.synced_at) badge.title = "同步于 " + sync.synced_at;
+  if (status === "failed") badge.title = didaErrorText(sync.last_error) || "稍后可在电脑端重试";
+  region.append(badge);
+  if (connected) {
+    const pending = state.didaSyncing.has(event.id);
+    const action = button(pending ? "正在同步…" : status === "failed" ? "重试同步" : "同步滴答", "ghost pc-only dida-sync-button", syncCurrentToDida);
+    action.dataset.didaSync = ""; region.append(action);
+  }
+  if (status === "failed" && sync.last_error) region.append(el("span", "dida-sync-error pc-only", didaErrorText(sync.last_error)));
+  updateDidaControls();
+}
+async function refreshDidaStatus() {
+  if (!state.authenticated || state.isOffline) return null;
+  const generation = state.authGeneration;
+  if (didaStatusPending?.generation === generation) return didaStatusPending.promise;
+  const sequence = ++didaStatusRequest;
+  const pending = (async () => {
+    const data = await apiFetch(DIDA_ROOT + "/status", { cache: "no-store" });
+    if (sequence !== didaStatusRequest || generation !== state.authGeneration || !state.authenticated) return null;
+    state.didaStatus = { configured: data.configured === true, connected: data.connected === true,
+      target_project_id: words(data.target_project_id), target_project_name: words(data.target_project_name),
+      updated_at: words(data.updated_at), expires_at: words(data.expires_at) };
+    renderDidaSync(); updateDidaControls();
+    return state.didaStatus;
+  })().finally(() => { if (didaStatusPending?.promise === pending) didaStatusPending = null; });
+  didaStatusPending = { generation, promise: pending };
+  return pending;
+}
+function closeDidaDialog() {
+  didaDialogRequest++;
+  if (ui["dida-dialog"].open) ui["dida-dialog"].close();
+  ui["dida-content"].replaceChildren(); ui["dida-message"].textContent = "";
+}
+function didaAction(label, kind, action, needsProjects = false) {
+  const node = button(label, kind + " pc-only", action);
+  node.dataset.didaAction = "";
+  if (needsProjects) node.dataset.requiresProjects = "true";
+  return node;
+}
+function paintDidaPanel() {
+  if (!ui["dida-dialog"].open || !state.authenticated) return;
+  const area = ui["dida-content"], config = state.didaStatus;
+  area.replaceChildren();
+  if (!config) {
+    area.append(didaAction("重新读取状态", "ghost", openDidaDialog)); updateDidaControls(); return;
+  }
+  if (narrow.matches) {
+    area.append(el("span", "badge " + (config.connected ? "dida-synced" : ""), config.connected ? "已连接" : "未连接滴答"));
+    if (config.connected) area.append(el("p", "", "当前清单：" + (config.target_project_id ? config.target_project_name || config.target_project_id : "收集箱（默认）")));
+    area.append(el("p", "helper", "手机端仅查看同步状态，请在电脑端连接滴答或选择目标清单。"));
+    updateDidaControls(); return;
+  }
+  if (!config.configured) {
+    area.append(el("p", "helper", "尚未配置滴答应用。请在服务端设置 DIDA_CLIENT_ID 与 DIDA_CLIENT_SECRET 后重试。"),
+      didaAction("重新读取状态", "ghost", openDidaDialog));
+  } else if (!config.connected) {
+    area.append(el("p", "helper", "连接后，整理活动或微调时间会自动写入滴答。已有活动可在电脑端点击「同步滴答」补推。"),
+      didaAction("一键连接滴答清单", "primary", connectDida));
+  } else {
+    const summary = el("div", "dida-connection");
+    summary.append(el("span", "badge dida-synced", "已连接"),
+      el("p", "", "当前清单：" + (config.target_project_id ? config.target_project_name || config.target_project_id : "收集箱（默认）")),
+      el("p", "helper", "更新于 " + (config.updated_at ? localTime(config.updated_at) : "时间未知")));
+    area.append(summary);
+    const label = el("label", "", "目标清单"); label.htmlFor = "dida-project-select";
+    const select = el("select", "dida-project-select"); select.id = "dida-project-select";
+    select.dataset.didaAction = ""; select.dataset.requiresProjects = "true";
+    const inbox = el("option", "", "收集箱（默认）"); inbox.value = ""; select.append(inbox);
+    for (const project of state.didaProjects) {
+      const option = el("option", "", words(project.name) || project.id); option.value = project.id; select.append(option);
+    }
+    if (config.target_project_id && !state.didaProjects.some(project => project.id === config.target_project_id)) {
+      const option = el("option", "", (config.target_project_name || "当前清单") + "（尚未读取或不可用）");
+      option.value = config.target_project_id; option.disabled = true; select.append(option);
+    }
+    select.value = config.target_project_id;
+    area.append(label, select);
+    if (!state.didaProjectsReady && !state.didaProjectsError) area.append(el("p", "helper", "正在读取可用清单…"));
+    if (state.didaProjectsError) {
+      const error = el("p", "auth-message", state.didaProjectsError); error.setAttribute("role", "alert"); area.append(error);
+    }
+    area.append(didaAction("保存目标清单", "primary", () => saveDidaTarget(select), true),
+      el("p", "helper", "保存后，下次整理、微调或手动同步时会使用此清单。"));
+    const actions = el("div", "inline-actions");
+    if (state.didaProjectsError) actions.append(didaAction("重新读取清单", "ghost", openDidaDialog));
+    actions.append(didaAction("重新授权", "ghost", connectDida), didaAction("断开连接", "ghost danger", disconnectDidaConnection));
+    area.append(actions);
+  }
+  updateDidaControls();
+}
+async function openDidaDialog() {
+  if (!state.authenticated || state.isOffline || state.didaBusy) return;
+  closeCalendarDialog();
+  const request = ++didaDialogRequest, generation = state.authGeneration;
+  state.didaProjects = []; state.didaProjectsReady = false; state.didaProjectsError = "";
+  ui["dida-content"].replaceChildren(); ui["dida-message"].textContent = "正在读取滴答同步设置…"; ui["dida-message"].dataset.kind = "";
+  if (!ui["dida-dialog"].open) ui["dida-dialog"].showModal();
+  const current = () => request === didaDialogRequest && generation === state.authGeneration && ui["dida-dialog"].open && !state.isOffline;
+  try {
+    const config = await refreshDidaStatus();
+    if (!current() || !config) return;
+    ui["dida-message"].textContent = ""; paintDidaPanel();
+    if (!config.configured || !config.connected || narrow.matches) return;
+    try {
+      const data = await apiFetch(DIDA_ROOT + "/projects", { cache: "no-store" });
+      if (!current()) return;
+      state.didaProjects = list(data.projects).filter(project => typeof project?.id === "string");
+      state.didaProjectsReady = true;
+    } catch (error) {
+      if (!current() || error.status === 401) return;
+      state.didaProjectsError = didaErrorText(error.message) || "清单读取失败，请重新授权后重试";
+    }
+    if (current()) paintDidaPanel();
+  } catch (error) {
+    if (current() && error.status !== 401) {
+      state.didaStatus = null; ui["dida-message"].textContent = didaErrorText(error.message); renderDidaSync(); paintDidaPanel();
+    }
+  }
+}
+async function didaMutation(action) {
+  if (!state.authenticated || state.isOffline || state.didaBusy || narrow.matches) return;
+  const generation = state.authGeneration;
+  state.didaBusy = true; updateDidaControls(); ui["dida-message"].textContent = ""; ui["dida-message"].dataset.kind = "";
+  try { await action(generation); }
+  catch (error) {
+    if (generation === state.authGeneration && error.status !== 401 && state.authenticated) {
+      const message = didaErrorText(error.message) || "操作失败，请稍后重试";
+      if (ui["dida-dialog"].open) ui["dida-message"].textContent = message;
+      else toast(message, "error");
+    }
+  } finally { if (generation === state.authGeneration) { state.didaBusy = false; updateDidaControls(); } }
+}
+async function connectDida() {
+  return didaMutation(async generation => {
+    const data = await apiFetch(DIDA_ROOT + "/authorize", { method: "POST" });
+    if (generation !== state.authGeneration || !state.authenticated || state.isOffline || narrow.matches) return;
+    const url = new URL(data.authorize_url);
+    if (url.origin !== "https://dida365.com" || url.pathname !== "/oauth/authorize") throw new Error("滴答授权地址无效，请重新读取设置");
+    window.location.assign(url.href);
+  });
+}
+async function saveDidaTarget(select) {
+  if (narrow.matches || !state.didaProjectsReady || select.selectedOptions[0]?.disabled) return;
+  const id = select.value, name = id ? state.didaProjects.find(project => project.id === id)?.name || "" : "";
+  return didaMutation(async generation => {
+    await apiFetch(DIDA_ROOT + "/config", { method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target_project_id: id, target_project_name: name }) });
+    if (generation !== state.authGeneration) return;
+    didaStatusRequest++; didaStatusPending = null;
+    await refreshDidaStatus();
+    if (generation !== state.authGeneration || state.isOffline) return;
+    paintDidaPanel(); ui["dida-message"].textContent = "目标清单已保存"; ui["dida-message"].dataset.kind = "success";
+    toast("滴答目标清单已保存");
+  });
+}
+async function disconnectDidaConnection() {
+  if (narrow.matches || !state.authenticated || state.isOffline || state.didaBusy || !confirm("确定断开滴答清单？已有任务会保留，后续活动将不再自动同步。")) return;
+  return didaMutation(async generation => {
+    await apiFetch(DIDA_ROOT + "/disconnect", { method: "POST" });
+    if (generation !== state.authGeneration) return;
+    state.didaStatus = null; didaStatusRequest++; didaStatusPending = null; await refreshDidaStatus();
+    if (generation !== state.authGeneration) return;
+    paintDidaPanel(); toast("已断开滴答连接，已有任务保留");
+  });
+}
+function didaSavedNotice(sync, successMessage, successKind = "success") {
+  if (sync?.status === "failed") {
+    toast("看板已保存成功，仅滴答同步失败；可稍后在电脑端点击「重试同步」。", "warning");
+  } else toast(successMessage, successKind);
+}
+async function syncCurrentToDida() {
+  if (narrow.matches || writeLocked() || state.loading || !state.event || !state.didaStatus?.connected || state.didaBusy) return;
+  const id = state.selected, generation = state.authGeneration;
+  if (state.didaSyncing.has(id)) return;
+  state.didaSyncing.add(id); renderDidaSync();
+  try {
+    const data = await apiFetch(eventPath(id) + "/sync/dida", { method: "POST" });
+    if (generation !== state.authGeneration || !state.authenticated) return;
+    state.listSequence++;
+    const sync = data.dida_sync ?? null;
+    state.events = state.events.map(event => event.id === id ? { ...event, dida_sync: sync } : event);
+    if (state.selected === id && state.event) { state.event = { ...state.event, dida_sync: sync }; renderDidaSync(); }
+    if (sync?.status === "failed") toast("滴答同步失败：" + (didaErrorText(sync.last_error) || "稍后请重试"), "warning");
+    else if (sync?.status === "skipped_no_time") toast("活动尚无明确开始时间，暂未推送滴答", "warning");
+    else if (sync?.status === "synced") toast("已同步滴答清单");
+    else toast("尚未连接滴答清单，请重新读取同步设置", "warning");
+    // 读取最新详情也让 SW 更新私有缓存；失败不覆盖刚收到的同步结果。
+    try {
+      const latest = await apiFetch(eventPath(id));
+      if (generation === state.authGeneration && state.selected === id && state.event) {
+        state.event = { ...state.event, dida_sync: latest.event?.dida_sync ?? sync }; renderDidaSync();
+      }
+    } catch { /* 同步结果已经显示，稍后可刷新离线缓存。 */ }
+  } catch (error) {
+    if (generation === state.authGeneration && error.status !== 401) toast(didaErrorText(error.message), "error");
+  } finally {
+    if (generation === state.authGeneration) { state.didaSyncing.delete(id); renderDidaSync(); updateControls(); }
+  }
+}
+async function didaWorkspaceReady() {
+  if (!state.authenticated) return;
+  const generation = state.authGeneration, url = new URL(window.location.href), result = url.searchParams.get("dida");
+  if (result) {
+    const reason = url.searchParams.get("reason");
+    url.searchParams.delete("dida"); url.searchParams.delete("reason");
+    history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+    if (result === "connected") toast("滴答清单连接成功");
+    else if (result === "error") {
+      const reasons = {
+        invalid_state: "授权校验已失效，请重新连接滴答清单",
+        authorization_denied: "滴答授权未完成，请重新连接",
+        token_exchange_failed: "滴答换票失败，请查看服务端诊断后重新连接",
+        token_response_invalid: "滴答换票响应缺少有效凭据，请重新连接",
+        integration_save_failed: "滴答授权结果保存失败，请检查数据库后重新连接",
+        callback_failed: "滴答授权回调处理失败，请重新连接",
+        unauthorized: "本地登录会话已失效，请登录后重新连接",
+        authorization_failed: "滴答授权失败，请检查应用配置后重新连接",
+      };
+      // 只展示白名单短码，未知 Query 内容不能混入诊断提示。
+      const shortReason = Object.hasOwn(reasons, reason) ? reason : "unknown";
+      toast((reasons[shortReason] || "滴答授权失败，请打开同步设置重新连接") + "（原因码：" + shortReason + "）", "error");
+    }
+  }
+  if (state.isOffline) return;
+  try {
+    const config = await refreshDidaStatus();
+    if (generation === state.authGeneration && config?.connected && !config.target_project_id && result === "connected") await openDidaDialog();
+  } catch (error) {
+    if (generation === state.authGeneration && error.status !== 401 && result === "connected") toast("已收到滴答连接回执，暂时无法读取设置，请联网后重试", "warning");
+  }
+}
+
 run(init);

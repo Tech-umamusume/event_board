@@ -243,3 +243,32 @@ body.lightbox-open { overflow: hidden; }
   .offline-bar[data-state="syncing"] .sync-dot { animation: sync-pulse 1.4s ease-in-out infinite; }
   @keyframes sync-pulse { 50% { opacity: .35; } }
 }
+
+/* 滴答控件沿用日历弹窗与既有状态色；移动端只保留静态同步状态。 */
+.sidebar-actions { flex-wrap: wrap; }
+#dida-settings { font-size: 12px; min-height: 36px; padding: 5px 7px; font-weight: 500; }
+.dida-dot { width: 7px; height: 7px; border-radius: 50%; background: #6b7280; flex-shrink: 0; }
+.dida-dot.connected { background: #15803d; }
+.detail-header { flex-wrap: wrap; }
+.dida-event-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.dida-badge { white-space: nowrap; }
+.dida-synced { background: #dcfce7; color: #166534; }
+.dida-failed { background: #fef2f2; color: #b91c1c; }
+.dida-sync-button { min-height: 32px; padding: 4px 7px; font-size: 12px; }
+.dida-sync-error { flex-basis: 100%; max-width: 48ch; overflow-wrap: anywhere; color: #b91c1c; font-size: 12px; }
+.dida-dialog { scrollbar-color: #9ca3af #f3f4f6; }
+.dida-content { display: grid; gap: 14px; }
+.dida-content > .button { justify-self: start; }
+.dida-content label { font-size: 14px; font-weight: 600; }
+.dida-connection { display: grid; gap: 6px; overflow-wrap: anywhere; }
+.dida-project-select { width: 100%; min-width: 0; max-width: 100%; min-height: 44px; font: inherit; color: #111827; background: #fff; border: 1px solid #9ca3af; border-radius: 8px; padding: 10px 12px; }
+.dida-project-select:disabled { color: var(--muted); cursor: wait; }
+.dida-message { color: #b91c1c; font-size: 13px; overflow-wrap: anywhere; margin-bottom: 14px; }
+.dida-message:empty { display: none; }
+.dida-message[data-kind="success"] { color: #166534; }
+@media (max-width: 768px) {
+  .dida-event-status { order: 3; }
+  .dida-badge { font-size: 11px; }
+  .dida-dialog { padding: 20px; }
+  .dida-dialog .inline-actions .button { min-height: 44px; }
+}

@@ -1,5 +1,5 @@
 "use strict";
-const SHELL_CACHE = "eb-shell-v2";
+const SHELL_CACHE = "eb-shell-v3";
 const PRIVATE_CACHE = "eb-private-v1";
 const SHELL_ASSETS = ["/", "/styles.css", "/app.js", "/manifest.json", "/icon.svg", "/icon-192.png", "/icon-512.png"];
 let privateEpoch = 0;
@@ -137,6 +137,8 @@ async function shellRead(request, event, navigation) {
 self.addEventListener("fetch", event => {
   const request = event.request, url = new URL(request.url);
   if (url.origin !== self.location.origin || request.method !== "GET") return;
+  // OAuth、配置和同步控制接口必须直连网络，绝不进入离线私有缓存。
+  if (url.pathname.startsWith("/api/integrations/")) return;
   if (url.pathname.startsWith("/api/auth/") || url.pathname === "/api/health" ||
       url.pathname.startsWith("/api/cal/") || url.pathname.endsWith("/calendar.ics")) return;
   if (url.pathname === "/api/events" || /^\/api\/events\/[^/]+$/.test(url.pathname) ||

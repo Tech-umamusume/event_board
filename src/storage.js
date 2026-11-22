@@ -428,3 +428,41 @@ export async function saveCompiledEvent(env, eventId, compiledData) {
   ).bind(JSON.stringify(compiledData), new Date().toISOString(), eventId).run();
   return getEventDetail(env, eventId);
 }
+
+// 集成存储只更新调用方明确提供的列，避免清单配置覆盖 OAuth Token。
+export async function getIntegrationConfig(db, provider = "dida") {
+  return db.prepare("SELECT * FROM integration_configs WHERE provider = ?").bind(provider).first();
+}
+export async function upsertIntegrationConfig(db, config) {
+  const provider = config.provider ?? "dida";
+  const fields = ["access_token", "refresh_token", "expires_at", "target_project_id", "target_project_name"]
+    .filter(key => config[key] !== undefined);
+  const columns = ["provider", ...fields, "updated_at"];
+  await db.prepare(`INSERT INTO integration_configs (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})
+    ON CONFLICT(provider) DO UPDATE SET ${[...fields, "updated_at"].map(key => `${key} = excluded.${key}`).join(", ")}`)
+    .bind(provider, ...fields.map(key => config[key]), new Date().toISOString()).run();
+  return getIntegrationConfig(db, provider);
+}
+export async function deleteIntegrationConfig(db, provider = "dida") {
+  await db.prepare("DELETE FROM integration_configs WHERE provider = ?").bind(provider).run();
+}
+export async function getEventSync(db, eventId, provider = "dida") {
+  return db.prepare("SELECT * FROM event_syncs WHERE event_id = ? AND provider = ?").bind(eventId, provider).first();
+}
+export async function listEventSyncs(db, provider = "dida") {
+  const { results } = await db.prepare("SELECT * FROM event_syncs WHERE provider = ?").bind(provider).all();
+  return results;
+}
+export async function upsertEventSync(db, record) {
+  const provider = record.provider ?? "dida";
+  const fields = ["external_project_id", "external_task_id", "payload_hash", "sync_status", "last_error", "synced_at"]
+    .filter(key => record[key] !== undefined);
+  const columns = ["event_id", "provider", ...fields, "updated_at"];
+  await db.prepare(`INSERT INTO event_syncs (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})
+    ON CONFLICT(event_id, provider) DO UPDATE SET ${[...fields, "updated_at"].map(key => `${key} = excluded.${key}`).join(", ")}`)
+    .bind(record.event_id, provider, ...fields.map(key => record[key]), new Date().toISOString()).run();
+  return getEventSync(db, record.event_id, provider);
+}
+export async function deleteEventSync(db, eventId, provider = "dida") {
+  await db.prepare("DELETE FROM event_syncs WHERE event_id = ? AND provider = ?").bind(eventId, provider).run();
+}

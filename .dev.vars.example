@@ -3,3 +3,6 @@ LLM_API_KEY=sk-replace-with-your-bailian-key
 LLM_MODEL=qwen3.8-flash
 AUTH_TOKEN=replace-with-your-private-password
 CAL_TOKEN=replace-with-your-32-char-calendar-token
+DIDA_CLIENT_ID=
+DIDA_CLIENT_SECRET=
+PUBLIC_BASE_URL=http://127.0.0.1:8787
