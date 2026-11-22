@@ -5,13 +5,15 @@
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": [
+      "/api/*"
+    ]
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "event-board-db",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "cfb945f8-fe25-43ab-92ca-660751475bed"
     }
   ],
   "r2_buckets": [
@@ -19,5 +21,16 @@
       "binding": "BUCKET",
       "bucket_name": "event-board-images"
     }
-  ]
+  ],
+  "routes": [
+    {
+      "pattern": "eb.837799.xyz",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "PUBLIC_BASE_URL": "https://eb.837799.xyz",
+    "LLM_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "LLM_MODEL": "qwen3.8-flash"
+  }
 }
